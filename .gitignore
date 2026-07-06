@@ -51,5 +51,7 @@ __pycache__/
 # External dependency
 NetworkDirect/
 
-# Placeholder file excluded from build
+# DLL outputs
+*.exp
+*.ilk excluded from build
 rdmaio/rdmaio/rdmaio.cpp

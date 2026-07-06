@@ -1,52 +1,45 @@
 # rdmaio
 
-Windows NetworkDirect (NDSPI) RDMA file transfer and benchmark tool over RoCE v2 / InfiniBand.
-
-## Hardware
-
-- Mellanox ConnectX-3 Pro (HP 544+FLR-QSFP, 40G RoCE / 56G IB FDR)
-- Two-port loopback: 192.168.100.2 ↔ 192.168.100.3
-- Visual Studio 2026 Community (v145 toolset)
+Windows NetworkDirect (NDSPI) RDMA file transfer & DLL for third-party apps.
 
 ## Build
 
 ```cmd
-# Step 1 — build ndutil.lib (once)
-msbuild D:\rdma\NetworkDirect\src\netdirect.sln /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v145
-
-# Step 2 — build rdmaio
-msbuild D:\rdma\rdmaio\rdmaio.slnx /p:Configuration=Release /p:Platform=x64
+build_all.bat
 ```
 
-## Usage
+Outputs:
+- `rdma_transfer.dll` / `.lib` — reusable RDMA transfer library  
+- `rdmaio.exe` — standalone CLI tool
 
-### File transfer (Send/Recv)
+## DLL API
+
+```c
+#include "rdmaio/rdma_transfer.h"
+#pragma comment(lib, "rdma_transfer.lib")
+
+// One-time init (call before any transfer)
+rdma_transfer_init();
+
+// File transfer
+rdma_send_file("192.168.100.2", 54321, L"D:\\data.bin");
+rdma_recv_file("192.168.100.2", 54321, L"C:\\received.bin");
+
+// Pure RDMA Write benchmark (Gbps)
+rdma_bench(0, "192.168.100.2", 54321, 512); // recv
+rdma_bench(1, "192.168.100.2", 54321, 512); // send
+
+// Progress callback
+rdma_set_progress_callback(my_callback, NULL);
+
+rdma_transfer_cleanup();
+```
+
+## CLI Usage
 
 ```cmd
-# Receiver
-rdmaio.exe -recv -ip 192.168.100.2 -o output.bin
-
-# Sender
 rdmaio.exe -send -ip 192.168.100.2 -file input.bin
-```
-
-### RDMA Write benchmark (pure memory, no disk I/O)
-
-```cmd
-# Receiver
-rdmaio.exe -bench -recv -ip 192.168.100.2
-
-# Sender
+rdmaio.exe -recv -ip 192.168.100.2 -o output.bin
 rdmaio.exe -bench -send -ip 192.168.100.2
+rdmaio.exe -bench -recv -ip 192.168.100.2
 ```
-
-## Performance (ConnectX-3 Pro, RoCE 40G loopback)
-
-| Mode | Throughput |
-|---|---|
-| File transfer (1 GB) | ~360 MB/s (disk-limited) |
-| RDMA Write (512 MB) | ~2.35 GB/s (**18.8 Gbps**) |
-
-## Tech Notes
-
-See [RDMA_PROJECT_TECH_NOTES.md](RDMA_PROJECT_TECH_NOTES.md) for complete technical documentation.

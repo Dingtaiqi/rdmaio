@@ -1,7 +1,7 @@
 <Solution>
   <Configurations>
     <Platform Name="x64" />
-    <Platform Name="x86" />
   </Configurations>
   <Project Path="rdmaio/rdmaio.vcxproj" />
+  <Project Path="rdma_transfer.vcxproj" />
 </Solution>
