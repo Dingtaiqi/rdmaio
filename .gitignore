@@ -7,10 +7,10 @@ x64/
 *.iobj
 *.ipdb
 *.tlog/
-*.log
 *.lastbuildstate
 *.unsuccessfulbuild
 *.res
+*.ipch
 
 # VS files
 .vs/
@@ -19,43 +19,37 @@ x64/
 *.vsidx
 DocumentLayout.json
 Browse.VC.db
-*.ipch
 AutoPCH/
 
-# Test outputs
-test_output.txt
-test_10mb_out.bin
-test_1gb_out.bin
-test_*.log
-recv.log
-send.log
-bench_recv.log
-bench_send.log
-ndpingpong_server.log
-ndpingpong_client.log
-recv_*.log
-send_*.log
-build_*.log
-
-# Test input files (big binaries)
-test_10mb.bin
-test_1gb.bin
+# Logs & test artifacts
+*.log
+*.bin
+*.txt
 
 # Temp scripts
-recv.bat
-send.bat
-recv_*.bat
-send_*.bat
-bench_recv.bat
-bench_send.bat
-bench_send_test.bat
+recv*.bat
+send*.bat
+bench*.bat
 test_transfer*.bat
 test_ndpingpong.bat
 recv_noredir.bat
 recv_direct_test.bat
 adapter_info.bat
 check_nic*.ps1
+bench_send_test.bat
 
-# Python cache
+# SSH
+*_pubkey*
+
+# Python
 __pycache__/
 *.pyc
+
+# Claude
+.claude/
+
+# External dependency
+NetworkDirect/
+
+# Placeholder file excluded from build
+rdmaio/rdmaio/rdmaio.cpp
