@@ -1,0 +1,61 @@
+# Build outputs
+x64/
+*.exe
+*.pdb
+*.lib
+*.obj
+*.iobj
+*.ipdb
+*.tlog/
+*.log
+*.lastbuildstate
+*.unsuccessfulbuild
+*.res
+
+# VS files
+.vs/
+*.user
+*.suo
+*.vsidx
+DocumentLayout.json
+Browse.VC.db
+*.ipch
+AutoPCH/
+
+# Test outputs
+test_output.txt
+test_10mb_out.bin
+test_1gb_out.bin
+test_*.log
+recv.log
+send.log
+bench_recv.log
+bench_send.log
+ndpingpong_server.log
+ndpingpong_client.log
+recv_*.log
+send_*.log
+build_*.log
+
+# Test input files (big binaries)
+test_10mb.bin
+test_1gb.bin
+
+# Temp scripts
+recv.bat
+send.bat
+recv_*.bat
+send_*.bat
+bench_recv.bat
+bench_send.bat
+bench_send_test.bat
+test_transfer*.bat
+test_ndpingpong.bat
+recv_noredir.bat
+recv_direct_test.bat
+adapter_info.bat
+check_nic*.ps1
+
+# Python cache
+__pycache__/
+*.pyc
