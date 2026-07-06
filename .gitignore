@@ -48,6 +48,10 @@ __pycache__/
 # Claude
 .claude/
 
+# Local helper scripts (superseded by build_all.bat)
+build_rdmaio.bat
+build_netdirect.bat
+
 # External dependency
 NetworkDirect/
 
