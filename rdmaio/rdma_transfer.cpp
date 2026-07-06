@@ -613,12 +613,23 @@ RDMA_TRANSFER_API int rdma_list_adapters(rdma_adapter_info* out, int max_count)
     hr = NdQueryAddressList(ND_QUERY_EXCLUDE_EMULATOR_ADDRESSES, pList, &len);
     if (FAILED(hr)) { HeapFree(GetProcessHeap(), 0, pList); return -1; }
 
+    char seen_ips[32][64]; int seen_count = 0;
     for (int i = 0; i < pList->iAddressCount && (out == NULL || count < max_count); i++)
     {
         sockaddr_in* pAddr = (sockaddr_in*)pList->Address[i].lpSockaddr;
         if (pAddr->sin_family != AF_INET) continue;
 
-        // Open adapter to query capabilities
+        char ipStr[64] = {};
+        InetNtopA(AF_INET, &pAddr->sin_addr, ipStr, sizeof(ipStr));
+
+        // Deduplicate by IP
+        bool dup = false;
+        for (int k = 0; k < seen_count; k++) {
+            if (strcmp(seen_ips[k], ipStr) == 0) { dup = true; break; }
+        }
+        if (dup) continue;
+        if (seen_count < 32) strcpy_s(seen_ips[seen_count++], sizeof(seen_ips[0]), ipStr);
+
         IND2Adapter* pAdapter = nullptr;
         hr = NdOpenAdapter(IID_IND2Adapter,
             (const sockaddr*)pAddr, sizeof(*pAddr), (void**)&pAdapter);
@@ -627,6 +638,8 @@ RDMA_TRANSFER_API int rdma_list_adapters(rdma_adapter_info* out, int max_count)
         ND2_ADAPTER_INFO ai = {}; ai.InfoVersion = ND_VERSION_2;
         ULONG aiSize = sizeof(ai);
         hr = pAdapter->Query(&ai, &aiSize);
+        pAdapter->Release();
+        if (FAILED(hr)) continue;
 
         if (out)
         {
@@ -647,7 +660,6 @@ RDMA_TRANSFER_API int rdma_list_adapters(rdma_adapter_info* out, int max_count)
         }
 
         count++;
-        pAdapter->Release();
     }
 
     HeapFree(GetProcessHeap(), 0, pList);
