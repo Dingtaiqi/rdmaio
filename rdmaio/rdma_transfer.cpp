@@ -596,6 +596,65 @@ static int InternalBenchSend(const char* remoteIp, USHORT port, int sizeMb) {
 }
 
 // ===================================================================
+// Adapter enumeration
+// ===================================================================
+RDMA_TRANSFER_API int rdma_list_adapters(rdma_adapter_info* out, int max_count)
+{
+    int count = 0;
+
+    // Get address list size first
+    SIZE_T len = 0;
+    HRESULT hr = NdQueryAddressList(ND_QUERY_EXCLUDE_EMULATOR_ADDRESSES, nullptr, &len);
+    if (hr != ND_BUFFER_OVERFLOW || len == 0) return -1;
+
+    SOCKET_ADDRESS_LIST* pList = (SOCKET_ADDRESS_LIST*)HeapAlloc(GetProcessHeap(), 0, len);
+    if (!pList) return -1;
+
+    hr = NdQueryAddressList(ND_QUERY_EXCLUDE_EMULATOR_ADDRESSES, pList, &len);
+    if (FAILED(hr)) { HeapFree(GetProcessHeap(), 0, pList); return -1; }
+
+    for (int i = 0; i < pList->iAddressCount && (out == NULL || count < max_count); i++)
+    {
+        sockaddr_in* pAddr = (sockaddr_in*)pList->Address[i].lpSockaddr;
+        if (pAddr->sin_family != AF_INET) continue;
+
+        // Open adapter to query capabilities
+        IND2Adapter* pAdapter = nullptr;
+        hr = NdOpenAdapter(IID_IND2Adapter,
+            (const sockaddr*)pAddr, sizeof(*pAddr), (void**)&pAdapter);
+        if (FAILED(hr)) continue;
+
+        ND2_ADAPTER_INFO ai = {}; ai.InfoVersion = ND_VERSION_2;
+        ULONG aiSize = sizeof(ai);
+        hr = pAdapter->Query(&ai, &aiSize);
+
+        if (out)
+        {
+            rdma_adapter_info* dst = &out[count];
+            memset(dst, 0, sizeof(*dst));
+            InetNtopA(AF_INET, &pAddr->sin_addr, dst->ip_address, sizeof(dst->ip_address));
+            dst->adapter_id          = ai.AdapterId;
+            dst->vendor_id           = ai.VendorId;
+            dst->device_id           = ai.DeviceId;
+            dst->max_transfer_mb     = (UINT32)(ai.MaxTransferLength / (1024 * 1024));
+            dst->max_inline_data     = ai.MaxInlineDataSize;
+            dst->max_cq_depth        = ai.MaxCompletionQueueDepth;
+            dst->max_initiator_depth = ai.MaxInitiatorQueueDepth;
+            dst->flags               = ai.AdapterFlags;
+            dst->has_in_order_dma    = !!(ai.AdapterFlags & ND_ADAPTER_FLAG_IN_ORDER_DMA_SUPPORTED);
+            dst->has_multi_engine    = !!(ai.AdapterFlags & ND_ADAPTER_FLAG_MULTI_ENGINE_SUPPORTED);
+            dst->has_loopback        = !!(ai.AdapterFlags & ND_ADAPTER_FLAG_LOOPBACK_CONNECTIONS_SUPPORTED);
+        }
+
+        count++;
+        pAdapter->Release();
+    }
+
+    HeapFree(GetProcessHeap(), 0, pList);
+    return count;
+}
+
+// ===================================================================
 // Public API
 // ===================================================================
 RDMA_TRANSFER_API int rdma_transfer_init(void)

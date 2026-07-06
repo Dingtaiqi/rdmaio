@@ -70,6 +70,32 @@ typedef void (*rdma_progress_cb)(double percent, double speed_mbps, void* user_d
 // Pass NULL to disable.
 RDMA_TRANSFER_API void rdma_set_progress_callback(rdma_progress_cb cb, void* user_data);
 
+// ---- Adapter Enumeration -------------------------------------------------
+// Info for one RDMA-capable adapter / address.
+typedef struct rdma_adapter_info {
+    char     ip_address[64];     // IPv4 string, e.g. "192.168.100.2"
+    UINT64   adapter_id;         // ND2_ADAPTER_INFO.AdapterId
+    UINT16   vendor_id;          // ND2_ADAPTER_INFO.VendorId
+    UINT16   device_id;          // ND2_ADAPTER_INFO.DeviceId
+    UINT32   max_transfer_mb;    // ND2_ADAPTER_INFO.MaxTransferLength in MiB
+    UINT32   max_inline_data;    // ND2_ADAPTER_INFO.MaxInlineDataSize
+    UINT32   max_cq_depth;       // ND2_ADAPTER_INFO.MaxCompletionQueueDepth
+    UINT32   max_initiator_depth;// ND2_ADAPTER_INFO.MaxInitiatorQueueDepth
+    UINT32   flags;              // ND2_ADAPTER_INFO.AdapterFlags
+    int      has_in_order_dma;   // ND_ADAPTER_FLAG_IN_ORDER_DMA_SUPPORTED
+    int      has_multi_engine;   // ND_ADAPTER_FLAG_MULTI_ENGINE_SUPPORTED
+    int      has_loopback;       // ND_ADAPTER_FLAG_LOOPBACK_CONNECTIONS_SUPPORTED
+} rdma_adapter_info;
+
+// Enumerate all RDMA-capable adapters on the system.
+//   info      — caller-allocated array, or NULL to just get count
+//   max_count — size of the info array (ignored if info is NULL)
+// Returns: number of adapters found, or -1 on error.
+// Call twice: once with info=NULL to get count, then with a buffer.
+RDMA_TRANSFER_API int rdma_list_adapters(
+    rdma_adapter_info* info,
+    int                max_count);
+
 #ifdef __cplusplus
 }
 #endif

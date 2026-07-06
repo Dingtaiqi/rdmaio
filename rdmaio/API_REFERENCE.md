@@ -196,6 +196,57 @@ int main() {
 | 0xC0000120 | ND_CANCELED — QP 被 flush，通常因远端断开 |
 | 0xC0000236 | ND_CONNECTION_REFUSED — 远端未监听 |
 
+### `rdma_list_adapters`
+
+```c
+typedef struct rdma_adapter_info {
+    char     ip_address[64];        // "192.168.100.2"
+    UINT64   adapter_id;            // hardware adapter ID
+    UINT16   vendor_id;             // PCI vendor ID (0x15B3 = Mellanox)
+    UINT16   device_id;            // PCI device ID
+    UINT32   max_transfer_mb;      // max single-transfer size (MiB)
+    UINT32   max_inline_data;      // max inline data (bytes)
+    UINT32   max_cq_depth;         // max completion queue depth
+    UINT32   max_initiator_depth;  // max initiator queue depth
+    UINT32   flags;                // raw ND2_ADAPTER_INFO.AdapterFlags
+    int      has_in_order_dma;     // supports in-order DMA
+    int      has_multi_engine;     // multi-QP parallel supported
+    int      has_loopback;         // loopback connections supported
+} rdma_adapter_info;
+
+int rdma_list_adapters(
+    rdma_adapter_info* info,       // NULL to get count
+    int                max_count   // size of info array
+);
+```
+
+枚举系统上所有 RDMA 网卡。同时返回每个适配器的硬件能力和特性标志。
+
+- **返回值**：找到的适配器数量，或 `-1` 出错
+- **用法**：先 `rdma_list_adapters(NULL, 0)` 获取数量，再分配数组调用第二次
+- **内部操作**：`NdQueryAddressList` → 遍历每个地址 → `NdOpenAdapter` → `Query` → 填充结构体
+
+**示例**：
+
+```cpp
+rdma_transfer_init();
+
+int n = rdma_list_adapters(NULL, 0);
+rdma_adapter_info* list = (rdma_adapter_info*)calloc(n, sizeof(*list));
+rdma_list_adapters(list, n);
+
+for (int i = 0; i < n; i++) {
+    printf("[%d] %s  max_xfer=%uMB  loopback=%d  multi_eng=%d\n",
+           i, list[i].ip_address,
+           list[i].max_transfer_mb,
+           list[i].has_loopback,
+           list[i].has_multi_engine);
+}
+free(list);
+```
+
+---
+
 ## 限制
 
 - 仅支持 IPv4 (RoCE v2)
