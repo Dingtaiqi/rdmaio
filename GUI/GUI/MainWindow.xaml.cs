@@ -26,6 +26,16 @@ namespace GUI
         private string? _currentFilePath;
         private ulong? _currentFileSize;
         private Stopwatch? _operationStopwatch;
+        private static readonly string _logPath =
+            Path.Combine(AppContext.BaseDirectory, "rdma_gui.log");
+
+        private static void Log(string msg)
+        {
+            string line = $"{DateTime.Now:HH:mm:ss.fff} [{Environment.CurrentManagedThreadId}] {msg}";
+            Debug.WriteLine(line);
+            try { File.AppendAllText(_logPath, line + Environment.NewLine); }
+            catch { /* best-effort */ }
+        }
 
         public MainWindow()
         {
@@ -242,6 +252,7 @@ namespace GUI
         {
             if (_isRunning && _cts != null)
             {
+                Log("CANCEL requested");
                 StatusTextBlock.Text = "正在取消…";
                 RdmaTransfer.Cancel();
                 _cts.Cancel();
@@ -297,6 +308,10 @@ namespace GUI
                 TransferProgressBar.Value = 0;
                 StatusTextBlock.Text = "正在准备…";
                 _operationStopwatch = Stopwatch.StartNew();
+
+                string modeLabel = ModeSendRadioButton.IsChecked == true ? "SEND"
+                    : ModeReceiveRadioButton.IsChecked == true ? "RECV" : "BENCH";
+                Log($"=== START {modeLabel} ip={ip} port={port} ===");
 
                 var progress = new Progress<RdmaProgress>(p =>
                 {
@@ -408,25 +423,26 @@ namespace GUI
             }
             catch (OperationCanceledException)
             {
+                Log("RESULT=CANCELLED");
                 StatusTextBlock.Text = "操作已取消。";
             }
             catch (Exception ex)
             {
+                Log($"RESULT=ERROR {ex.Message}");
                 ShowError($"操作失败：{ex.Message}");
                 StatusTextBlock.Text = "操作失败。";
             }
             finally
             {
+                if (operationSucceeded) Log("RESULT=OK");
+
                 // Clean up any partial file left by an interrupted/failed receive.
                 if (!operationSucceeded && !string.IsNullOrEmpty(receiveOutputFilePath) && File.Exists(receiveOutputFilePath))
                 {
-                    try { File.Delete(receiveOutputFilePath); }
+                    try { File.Delete(receiveOutputFilePath); Log($"CLEANUP deleted {receiveOutputFilePath}"); }
                     catch { /* best-effort */ }
                 }
 
-                // Force re-load file info next time so MD5 re-reads the file
-                // into OS cache — prevents disk-read latency from starving the
-                // receiver's receive queue on retry.
                 if (!operationSucceeded)
                 {
                     _currentFilePath = null;
@@ -437,6 +453,7 @@ namespace GUI
                 _cts = null;
                 SetRunning(false);
                 _operationStopwatch?.Stop();
+                Log($"=== DONE ===\n");
             }
         }
 
