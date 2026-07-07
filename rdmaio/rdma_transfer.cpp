@@ -23,7 +23,7 @@
 
 #pragma comment(lib, "Ws2_32.lib")
 
-static const DWORD CHUNK_SIZE   = 4 * 1024 * 1024;
+static const DWORD CHUNK_SIZE   = 2 * 1024 * 1024;      // 2 MiB chunks
 static const DWORD CQ_DEPTH     = 256;
 static const DWORD QP_DEPTH     = 128;
 static const DWORD ALIGNMENT    = 4096;
@@ -470,9 +470,7 @@ static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath
             : std::wstring(outPath);
 
         hFile = CreateFileW(finalPath.c_str(), GENERIC_WRITE, 0, nullptr,
-                            CREATE_ALWAYS,
-                            FILE_FLAG_WRITE_THROUGH,
-                            nullptr);
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hFile == INVALID_HANDLE_VALUE) {
             sge_chunk.Buffer = pTerm; sge_chunk.BufferLength = sizeof(TerminateCmd);
             SendAbortSignal(ctx, sge_chunk, pTerm);
@@ -485,38 +483,47 @@ static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath
 
         while (bytesReceived < fileSize && !diskError) {
             if (IsCancelled()) { ret = -1; diskError = true; break; }
-            while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
-            if (IsCancelled()) { ret = -1; diskError = true; break; }
-            if (result.Status != ND_SUCCESS || result.RequestContext != CHUNK_RECV_CTX) {
-                sprintf_s(tmp, "RECV: CQ error status=0x%08X ctx=%p bytesRecv=%llu",
-                    result.Status, result.RequestContext, bytesReceived); DbgLog(tmp);
-                ret = -1; diskError = true; break;
-            }
-            DWORD received = result.BytesTransferred;
-            if (bytesReceived == 0) {
-                sprintf_s(tmp, "RECV: first chunk arrived, bytes=%lu", received); DbgLog(tmp);
-            }
-            // Log every 32nd chunk
-            if ((bytesReceived / CHUNK_SIZE) % 32 == 0 && bytesReceived > 0) {
-                sprintf_s(tmp, "RECV: chunk %llu OK, ringIdx=%lu, fileSize=%llu",
-                    bytesReceived / CHUNK_SIZE, ringIdx, fileSize); DbgLog(tmp);
-            }
 
-            if (bytesReceived + received < fileSize) {
-                DWORD nextExpect = (fileSize - (bytesReceived + received) > CHUNK_SIZE)
-                    ? CHUNK_SIZE : (DWORD)(fileSize - (bytesReceived + received));
-                sge_chunk.Buffer = chunkBufs[ringIdx];
-                sge_chunk.BufferLength = nextExpect;
-                hr = ctx.pQp->Receive(CHUNK_RECV_CTX, &sge_chunk, 1);
-                if (FAILED(hr)) { ret = -1; diskError = true; break; }
+            // Phase 1: drain available completions, repost immediately
+            struct { DWORD bytes; DWORD bufIdx; } batch[64];
+            int batchCount = 0;
+            uint64_t bytesPending = 0;
+            for (int b = 0; b < 64; b++) {
+                if (ctx.pCq->GetResults(&result, 1) == 0) break;
+                if (IsCancelled()) { ret = -1; diskError = true; break; }
+                if (result.Status != ND_SUCCESS || result.RequestContext != CHUNK_RECV_CTX) {
+                    sprintf_s(tmp, "RECV: CQ error status=0x%08X bytesRecv=%llu",
+                        result.Status, bytesReceived); DbgLog(tmp);
+                    ret = -1; diskError = true; break;
+                }
+                DWORD rxd = result.BytesTransferred;
+                // Repost before write — keep queue full
+                if (bytesReceived + bytesPending + rxd < fileSize) {
+                    uint64_t remaining = fileSize - (bytesReceived + bytesPending + rxd);
+                    DWORD nextExpect = (remaining > CHUNK_SIZE) ? CHUNK_SIZE : (DWORD)remaining;
+                    DWORD repostIdx = (ringIdx + batchCount) % NUM_CHUNK_BUFS;
+                    sge_chunk.Buffer = chunkBufs[repostIdx];
+                    sge_chunk.BufferLength = nextExpect;
+                    hr = ctx.pQp->Receive(CHUNK_RECV_CTX, &sge_chunk, 1);
+                    if (FAILED(hr)) { sprintf_s(tmp, "RECV: repost[%lu] fail 0x%08X", repostIdx, hr); DbgLog(tmp); ret = -1; diskError = true; break; }
+                }
+                batch[batchCount].bytes  = rxd;
+                batch[batchCount].bufIdx = ringIdx;
+                bytesPending += rxd;
+                batchCount++;
+                ringIdx = (ringIdx + 1) % NUM_CHUNK_BUFS;
             }
+            if (diskError) break;
 
-            DWORD wb = 0;
-            if (!WriteFile(hFile, chunkBufs[ringIdx], received, &wb, nullptr) || wb != received) {
-                ret = -1; diskError = true; break;
+            // Phase 2: write batch to disk
+            for (int b = 0; b < batchCount; b++) {
+                DWORD wb = 0;
+                if (!WriteFile(hFile, chunkBufs[batch[b].bufIdx], batch[b].bytes, &wb, nullptr) || wb != batch[b].bytes) {
+                    ret = -1; diskError = true; break;
+                }
+                bytesReceived += batch[b].bytes;
             }
-            bytesReceived += received;
-            ringIdx = (ringIdx + 1) % NUM_CHUNK_BUFS;
+            if (diskError) break;
 
             LARGE_INTEGER tn; QueryPerformanceCounter(&tn);
             FireProgress(bytesReceived, fileSize, (double)(tn.QuadPart - t0.QuadPart) / (double)freq.QuadPart);
