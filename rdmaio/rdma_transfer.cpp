@@ -272,7 +272,10 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
             while (!sendDone && !aborted) {
                 while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
                 if (IsCancelled()) { SET_ERROR("Cancelled by user"); ret = -1; break; }
-                if (result.Status != ND_SUCCESS) { SET_ERROR("Chunk send CQ error"); ret = -1; break; }
+                if (result.Status != ND_SUCCESS) {
+                    char buf[64]; sprintf_s(buf, "Chunk send CQ: 0x%08X", result.Status);
+                    SET_ERROR(buf); ret = -1; break;
+                }
                 if (result.RequestContext == CHUNK_SEND_CTX)      { sendDone = true; bytesSent += toRead; }
                 else if (result.RequestContext == TERM_RECV_CTX)  { if (pTerm->cmd == TERM_CMD_ABORT) { SET_ERROR("Receiver disk error"); aborted = true; ret = -1; } }
                 else { SET_ERROR("Unexpected CQ context"); ret = -1; break; }
