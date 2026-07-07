@@ -68,6 +68,9 @@ static rdma_metadata_cb  g_metadata_cb  = nullptr;
 static void*             g_metadata_ctx = nullptr;
 static volatile LONG     g_cancel_flag  = 0;
 static LONG              g_init_count   = 0;
+static char              g_last_error[256] = "";
+
+#define SET_ERROR(msg) strcpy_s(g_last_error, sizeof(g_last_error), msg)
 
 // ---- Helpers ------------------------------------------------------------
 static void* AllocAligned(size_t sz) {
@@ -196,30 +199,30 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
 
     hr = ctx.pMr->Register(pBuf, bufSize, ND_MR_FLAG_ALLOW_LOCAL_WRITE, &ctx.ov);
     if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pMr, &ctx.ov);
-    if (FAILED(hr)) { CleanupNd(ctx); return -1; }
+    if (FAILED(hr)) { SET_ERROR("Register buffer failed"); CleanupNd(ctx); return -1; }
 
     do {
         UINT32 localToken = ctx.pMr->GetLocalToken();
 
         hr = ctx.pConnector->Bind((const sockaddr*)&localAddr, sizeof(localAddr));
         if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
-        if (FAILED(hr)) { ret = -1; break; }
+        if (FAILED(hr)) { SET_ERROR("Bind failed"); ret = -1; break; }
 
         hr = ctx.pConnector->Connect(ctx.pQp, (const sockaddr*)&remoteAddr, sizeof(remoteAddr),
                                       0, 0, nullptr, 0, &ctx.ov);
         if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
-        if (FAILED(hr)) { ret = -1; break; }
+        if (FAILED(hr)) { SET_ERROR("Connect failed"); ret = -1; break; }
 
         hr = ctx.pConnector->CompleteConnect(&ctx.ov);
         if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
-        if (FAILED(hr)) { ret = -1; break; }
+        if (FAILED(hr)) { SET_ERROR("CompleteConnect failed"); ret = -1; break; }
 
         hFile = CreateFileW(filePath, GENERIC_READ, FILE_SHARE_READ,
                             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hFile == INVALID_HANDLE_VALUE) { ret = -1; break; }
 
         LARGE_INTEGER fsLi;
-        if (!GetFileSizeEx(hFile, &fsLi)) { ret = -1; break; }
+        if (!GetFileSizeEx(hFile, &fsLi)) { SET_ERROR("GetFileSizeEx failed"); ret = -1; break; }
         const uint64_t fileSize = (uint64_t)fsLi.QuadPart;
 
         FileMeta*      pMeta  = (FileMeta*)pBuf;
@@ -234,7 +237,7 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
         ND2_SGE sge = {}; sge.Buffer = pMeta; sge.BufferLength = sizeof(FileMeta);
         sge.MemoryRegionToken = localToken;
         hr = ctx.pQp->Send(META_SEND_CTX, &sge, 1, 0);
-        if (FAILED(hr)) { ret = -1; break; }
+        if (FAILED(hr)) { SET_ERROR("Send metadata failed"); ret = -1; break; }
 
         ND2_RESULT result = {}; bool metaDone = false;
         while (!metaDone) {
@@ -260,16 +263,16 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
 
             sge.Buffer = pChunk; sge.BufferLength = toRead;
             hr = ctx.pQp->Send(CHUNK_SEND_CTX, &sge, 1, 0);
-            if (FAILED(hr)) { ret = -1; break; }
+            if (FAILED(hr)) { SET_ERROR("Send chunk failed"); ret = -1; break; }
 
             bool sendDone = false;
             while (!sendDone && !aborted) {
                 while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
-                if (IsCancelled()) { ret = -1; break; }
-                if (result.Status != ND_SUCCESS) { ret = -1; break; }
+                if (IsCancelled()) { SET_ERROR("Cancelled by user"); ret = -1; break; }
+                if (result.Status != ND_SUCCESS) { SET_ERROR("Chunk send CQ error"); ret = -1; break; }
                 if (result.RequestContext == CHUNK_SEND_CTX)      { sendDone = true; bytesSent += toRead; }
-                else if (result.RequestContext == TERM_RECV_CTX)  { if (pTerm->cmd == TERM_CMD_ABORT) { aborted = true; ret = -1; } }
-                else { ret = -1; break; }
+                else if (result.RequestContext == TERM_RECV_CTX)  { if (pTerm->cmd == TERM_CMD_ABORT) { SET_ERROR("Receiver disk error"); aborted = true; ret = -1; } }
+                else { SET_ERROR("Unexpected CQ context"); ret = -1; break; }
             }
             if (ret) break;
 
@@ -779,6 +782,11 @@ RDMA_TRANSFER_API void rdma_set_metadata_callback(rdma_metadata_cb cb, void* use
 {
     g_metadata_cb  = cb;
     g_metadata_ctx = user_data;
+}
+
+RDMA_TRANSFER_API const char* rdma_transfer_last_error(void)
+{
+    return g_last_error;
 }
 
 RDMA_TRANSFER_API void rdma_transfer_cancel(void)

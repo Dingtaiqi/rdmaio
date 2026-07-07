@@ -139,7 +139,8 @@ namespace GUI
                     cancellationToken.ThrowIfCancellationRequested();
                     if (ret != 0)
                     {
-                        throw new InvalidOperationException($"rdma_send_file failed with code {ret}.");
+                        string detail = Marshal.PtrToStringAnsi(RdmaNative.rdma_transfer_last_error()) ?? "unknown";
+                        throw new InvalidOperationException($"发送失败 [{detail}] (code {ret})");
                     }
                 }
                 finally

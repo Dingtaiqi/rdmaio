@@ -79,6 +79,12 @@ typedef void (*rdma_metadata_cb)(const char* filename, uint64_t file_size, void*
 
 RDMA_TRANSFER_API void rdma_set_metadata_callback(rdma_metadata_cb cb, void* user_data);
 
+// ---- Error Diagnostics ---------------------------------------------------
+// After any transfer function returns -1, call this to get a human-readable
+// error message describing where the failure occurred.
+// Result points to a static buffer valid until the next rdma_* call.
+RDMA_TRANSFER_API const char* rdma_transfer_last_error(void);
+
 // ---- Cancel --------------------------------------------------------------
 // Cancel any in-progress rdma_send_file / rdma_recv_file / rdma_bench call
 // from another thread.  The blocked call will return -1.
