@@ -485,6 +485,11 @@ static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath
             if (bytesReceived == 0) {
                 sprintf_s(tmp, "RECV: first chunk arrived, bytes=%lu", received); DbgLog(tmp);
             }
+            // Log every 32nd chunk
+            if ((bytesReceived / CHUNK_SIZE) % 32 == 0 && bytesReceived > 0) {
+                sprintf_s(tmp, "RECV: chunk %llu OK, ringIdx=%lu, fileSize=%llu",
+                    bytesReceived / CHUNK_SIZE, ringIdx, fileSize); DbgLog(tmp);
+            }
 
             if (bytesReceived + received < fileSize) {
                 DWORD nextExpect = (fileSize - (bytesReceived + received) > CHUNK_SIZE)
