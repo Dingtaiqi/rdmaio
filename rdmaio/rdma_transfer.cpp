@@ -91,10 +91,13 @@ static void CleanupNd(NdContext& ctx) {
     if (ctx.pConnector){ hr = ctx.pConnector->Disconnect(&ctx.ov);
                          if (hr == ND_PENDING) ctx.pConnector->GetOverlappedResult(&ctx.ov, TRUE); }
     if (ctx.pQp)       { ctx.pQp->Release();       ctx.pQp       = nullptr; }
-    if (ctx.pCq)       { ctx.pCq->Release();       ctx.pCq       = nullptr; }
     if (ctx.pConnector){ ctx.pConnector->Release();ctx.pConnector= nullptr; }
-    if (ctx.pListener) { ctx.pListener->Release(); ctx.pListener  = nullptr; }
     if (ctx.pMr)       { ctx.pMr->Release();       ctx.pMr       = nullptr; }
+    // Flush providers to ensure the kernel ND driver has fully released
+    // hardware QP resources before a new connection is made.
+    NdFlushProviders();
+    if (ctx.pCq)       { ctx.pCq->Release();       ctx.pCq       = nullptr; }
+    if (ctx.pListener) { ctx.pListener->Release(); ctx.pListener  = nullptr; }
     if (ctx.hOvFile != INVALID_HANDLE_VALUE)       { CloseHandle(ctx.hOvFile); ctx.hOvFile = INVALID_HANDLE_VALUE; }
     if (ctx.pAdapter)  { ctx.pAdapter->Release();  ctx.pAdapter  = nullptr; }
     if (ctx.ov.hEvent) { CloseHandle(ctx.ov.hEvent); ctx.ov.hEvent= nullptr; }
