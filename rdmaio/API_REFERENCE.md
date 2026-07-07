@@ -1,47 +1,25 @@
-# rdma_transfer.dll API Reference
+# rdma_transfer.dll — API Reference
 
-## 概述
+基于 Windows NetworkDirect (NDSPI) 的 RDMA 文件传输库，纯 C 接口，任何 C/C++ 项目均可调用。
 
-`rdma_transfer.dll` 是一个基于 Windows NetworkDirect (NDSPI) 的 RDMA 文件传输库，提供纯 C 接口，可在任何 C/C++ 项目中调用。
-
-依赖：需要 Mellanox WinOF 驱动和 NDSPI provider 已安装。
+**依赖**：Mellanox/Intel/Chelsio ND 驱动。
 
 ---
 
-## 快速集成
+## 目录
 
-### 1. 复制文件
-
-```
-your_project/
-├── rdma_transfer.h      # 头文件
-├── rdma_transfer.lib    # 导入库（链接用）
-├── rdma_transfer.dll    # 运行时 DLL（放 exe 同目录）
-└── your_app.cpp
-```
-
-### 2. 代码
-
-```cpp
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include "rdma_transfer.h"
-#pragma comment(lib, "rdma_transfer.lib")
-
-int main() {
-    rdma_transfer_init();
-
-    // 发送文件到 192.168.100.2:54321
-    rdma_send_file("192.168.100.2", 54321, L"D:\\data.bin");
-
-    rdma_transfer_cleanup();
-    return 0;
-}
-```
+| 分组 | 函数 |
+|---|---|
+| [生命周期](#生命周期) | `rdma_transfer_init`, `rdma_transfer_cleanup` |
+| [文件传输](#文件传输) | `rdma_send_file`, `rdma_recv_file` |
+| [性能测试](#性能测试) | `rdma_bench` |
+| [回调](#回调) | `rdma_set_progress_callback`, `rdma_set_metadata_callback` |
+| [控制](#控制) | `rdma_transfer_cancel` |
+| [枚举](#枚举) | `rdma_list_adapters` |
 
 ---
 
-## API 详细说明
+## 生命周期
 
 ### `rdma_transfer_init`
 
@@ -49,13 +27,12 @@ int main() {
 int rdma_transfer_init(void);
 ```
 
-初始化 RDMA 传输栈。必须在任何其他 API 调用之前调用。
+初始化 RDMA 栈。首次调用执行 `WSAStartup` → `NdStartup`。
 
-- **返回值**：`0` 成功，`-1` 失败
-- **线程安全**：内部用引用计数，可多次调用，只需最后一次 `cleanup` 时真正卸载
-- **内部操作**：`WSAStartup` → `NdStartup`
-
----
+| 属性 | 值 |
+|---|---|
+| 返回值 | `0` 成功, `-1` 失败 |
+| 线程安全 | 引用计数，允许多次调用 |
 
 ### `rdma_transfer_cleanup`
 
@@ -63,82 +40,91 @@ int rdma_transfer_init(void);
 void rdma_transfer_cleanup(void);
 ```
 
-清理 RDMA 传输栈。与 `rdma_transfer_init` 配对使用。
-
-- **内部操作**：`NdCleanup` → `WSACleanup`
-- 如果有未完成的传输，行为未定义（确保传输完成后再调用）
+清理 RDMA 栈。与 `init` 配对，引用计数归零时执行 `NdCleanup` → `WSACleanup`。
 
 ---
+
+## 文件传输
 
 ### `rdma_send_file`
 
 ```c
 int rdma_send_file(
-    const char*  remote_ip,    // 远端 IPv4 地址，如 "192.168.100.2"
-    unsigned short port,       // 端口号，如 54321
-    const wchar_t* file_path   // 待发送文件的绝对路径
+    const char*    remote_ip,    // 远端 IPv4, 如 "192.168.100.2"
+    unsigned short port,         // 端口号, 如 54321
+    const wchar_t* file_path     // 待发送文件的绝对路径
 );
 ```
 
-通过 RDMA Send/Recv 发送文件到远端。**阻塞调用**，传输完成后返回。
+通过 RDMA Send/Recv 发送文件。**阻塞**，传输完成或出错才返回。
 
-**传输协议**：
-1. 发送 268 字节元数据（文件大小 + 文件名）
-2. 按 4 MB 分块发送文件数据
-3. 远端磁盘写入失败时接收终止信号
+**协议**: 268 字节元数据 (文件名+大小) → 4 MB 分块数据 → 终止信号。
 
-- **返回值**：`0` 成功，`-1` 失败
-- **进度**：可通过 `rdma_set_progress_callback` 注册回调
-- **远端**：必须在接收端先调用 `rdma_recv_file` 等待连接
-
----
+| 属性 | 值 |
+|---|---|
+| 返回值 | `0` 成功, `-1` 失败 |
+| 可取消 | `rdma_transfer_cancel()` |
+| 进度 | `rdma_set_progress_callback` |
 
 ### `rdma_recv_file`
 
 ```c
 int rdma_recv_file(
-    const char*   local_ip,     // 本地 RDMA 网卡 IPv4，如 "192.168.100.2"
-    unsigned short port,        // 端口号，需与发送端一致
-    const wchar_t* output_path  // 接收文件的保存路径
+    const char*    local_ip,     // 本地 RDMA 网卡 IP
+    unsigned short port,         // 端口号，需与发送端一致
+    const wchar_t* output_path   // 保存路径 (目录则自动拼接文件名)
 );
 ```
 
-监听并接收来自远端的文件。**阻塞调用**，直到连接建立、传输完成或出错才返回。
+监听并接收文件。**阻塞**。如果 `output_path` 是目录，自动用元数据中的文件名拼接。
 
-- **返回值**：`0` 成功，`-1` 失败
-- **行为**：创建 `output_path` 指定的文件（覆盖已存在的），写入接收到的数据
-- **磁盘写入失败**：向发送端发送终止信号 (cmd=0xDEADBEEF)
-- **进度**：可通过 `rdma_set_progress_callback` 注册回调
+| 属性 | 值 |
+|---|---|
+| 返回值 | `0` 成功, `-1` 失败 |
+| 可取消 | `rdma_transfer_cancel()` |
+| 进度 | `rdma_set_progress_callback` |
+| 元数据 | `rdma_set_metadata_callback` |
+| 磁盘失败 | 向发送端发终止信号 (cmd=0xDEADBEEF) |
 
 ---
+
+## 性能测试
 
 ### `rdma_bench`
 
 ```c
 int rdma_bench(
-    int            side,        // 0 = 接收端, 1 = 发送端
-    const char*    ip,          // IP 地址
-    unsigned short port,        // 端口号
-    int            size_mb      // 传输数据量（MiB），接收端据此分配内存
+    int            side,         // 0 = 接收端, 1 = 发送端
+    const char*    ip,           // IP 地址
+    unsigned short port,         // 端口号
+    int            size_mb       // 传输数据量 (MiB)
 );
 ```
 
-纯内存 RDMA Write 带宽测试。**不涉及磁盘 I/O**，发送端连续 RDMA Write 到接收端预注册的内存缓冲区。
+纯内存 RDMA Write 带宽测试，**不涉及磁盘 I/O**。发送端输出：
 
-- **返回值**：`0` 成功，`-1` 失败
-- **发送端**：发起连接，接收远端内存令牌后执行 RDMA Write，打印吞吐量到 stdout
-- **接收端**：分配 `size_mb` MB 内存并注册为 RDMA 可写，等待发送端写入
-- **打印格式**：`RDMA Write: 512 MB in 213.4 ms  |  2399.7 MB/s  (19.20 Gbps)`
+```
+RDMA Write: 512 MB in 213.4 ms  |  2399.7 MB/s  (19.20 Gbps)
+```
+
+| 属性 | 值 |
+|---|---|
+| 返回值 | `0` 成功, `-1` 失败 |
+| 可取消 | `rdma_transfer_cancel()` |
+| 接收端 | 分配 `size_mb` MB 内存并注册为远端可写 |
+| 发送端 | 连续 RDMA Write + SILENT_SUCCESS |
 
 ---
+
+## 回调
 
 ### `rdma_set_progress_callback`
 
 ```c
 typedef void (*rdma_progress_cb)(
-    double percent,       // 进度百分比 0.0 ~ 100.0
-    double speed_mbps,    // 瞬时速度 MB/s
-    void*  user_data      // 用户自定义上下文
+    double percent,              // 0.0 ~ 100.0
+    double speed_mbps,           // 瞬时速度 MB/s
+    void*  user_data             // 用户上下文
 );
 
 void rdma_set_progress_callback(
@@ -147,19 +133,91 @@ void rdma_set_progress_callback(
 );
 ```
 
-注册传输进度回调。在每次数据块传输完成后调用（大约每 4 MB 一次）。
+每个数据块完成时调用（约每 4 MB 一次）。传 `NULL` 取消。
 
-- **callback**：传入 `NULL` 取消回调
-- **user_data**：透传给回调的上下文指针
-- **线程**：回调在传输线程中同步调用，不要在回调中做耗时操作
+> 回调在传输线程内**同步**调用，不要做耗时操作。
+
+### `rdma_set_metadata_callback`
+
+```c
+typedef void (*rdma_metadata_cb)(
+    const char* filename,        // 原始文件名 (ANSI)
+    uint64_t    file_size,       // 文件总字节数
+    void*       user_data        // 用户上下文
+);
+
+void rdma_set_metadata_callback(
+    rdma_metadata_cb callback,
+    void*             user_data
+);
+```
+
+**仅接收端**。收到发送端元数据时调用，可在回调中确定保存文件名。传 `NULL` 取消。
 
 ---
 
-## 示例：带进度的文件发送
+## 控制
 
-```cpp
+### `rdma_transfer_cancel`
+
+```c
+void rdma_transfer_cancel(void);
+```
+
+从**另一个线程**调用，中断正在进行的 `rdma_send_file` / `rdma_recv_file` / `rdma_bench`。
+
+- 被中断的阻塞调用返回 `-1`
+- 空闲时调用无副作用
+- 微秒级响应（CQ 轮询立即退出）
+
+---
+
+## 枚举
+
+### `rdma_list_adapters`
+
+```c
+typedef struct rdma_adapter_info {
+    char     ip_address[64];        // IPv4 地址
+    UINT64   adapter_id;            // 适配器 ID
+    UINT16   vendor_id;             // PCI vendor (0x15B3 = Mellanox, 0x02C9 = HP)
+    UINT16   device_id;             // PCI device (0x1007 = ConnectX-3 Pro)
+    UINT32   max_transfer_mb;       // 最大单次传输 (MiB)
+    UINT32   max_inline_data;       // 最大内联数据 (字节)
+    UINT32   max_cq_depth;          // CQ 深度上限
+    UINT32   max_initiator_depth;   // 发送队列深度上限
+    UINT32   flags;                 // 原始 AdapterFlags
+    int      has_in_order_dma;      // 支持有序 DMA
+    int      has_multi_engine;      // 支持多 QP 并行
+    int      has_loopback;          // 支持 loopback
+} rdma_adapter_info;
+
+int rdma_list_adapters(
+    rdma_adapter_info* info,        // NULL 仅取数量
+    int                max_count    // 数组容量
+);
+```
+
+枚举所有 RDMA 网卡。按 IP 去重。
+
+| 返回值 | 含义 |
+|---|---|
+| `> 0` | 适配器数量 |
+| `0` | 无 RDMA 网卡 |
+| `-1` | 调用失败 |
+
+---
+
+## 示例
+
+### 带进度的文件发送
+
+```c
+#include "rdma_transfer.h"
+#pragma comment(lib, "rdma_transfer.lib")
+
 void on_progress(double pct, double speed, void* ctx) {
-    printf("\rProgress: %.1f%%  (%.1f MB/s)", pct, speed);
+    printf("\r%.1f%%  %.1f MB/s", pct, speed);
     fflush(stdout);
 }
 
@@ -167,90 +225,59 @@ int main() {
     rdma_transfer_init();
     rdma_set_progress_callback(on_progress, NULL);
 
-    int ret = rdma_send_file("192.168.100.2", 54321, L"D:\\bigfile.bin");
-    printf("\nTransfer %s\n", ret == 0 ? "OK" : "FAILED");
+    int ret = rdma_send_file("192.168.100.2", 54321, L"D:\\data.bin");
+    printf("\n%s\n", ret == 0 ? "OK" : "FAILED");
 
     rdma_transfer_cleanup();
     return ret;
 }
 ```
 
-## 典型部署拓扑
-
-```
-┌─────────────────┐         RDMA (RoCE v2)         ┌─────────────────┐
-│   发送端         │ ◄──────────────────────────► │   接收端         │
-│                  │   192.168.100.3 → 100.2       │                  │
-│ rdma_send_file() │                               │ rdma_recv_file() │
-│   (主动连接)      │                               │   (被动监听)      │
-└─────────────────┘                               └─────────────────┘
-```
-
-## 错误处理
-
-所有函数返回值：`0` = 成功，`-1` = 失败。库内部使用 `printf` 输出错误详情到 stdout。常见错误码：
-
-| HRESULT | 含义 |
-|---|---|
-| 0xC00000B5 | ND_IO_TIMEOUT — 远端未及时投递 receive（RNR 超时） |
-| 0xC0000120 | ND_CANCELED — QP 被 flush，通常因远端断开 |
-| 0xC0000236 | ND_CONNECTION_REFUSED — 远端未监听 |
-
-### `rdma_list_adapters`
+### 枚举网卡
 
 ```c
-typedef struct rdma_adapter_info {
-    char     ip_address[64];        // "192.168.100.2"
-    UINT64   adapter_id;            // hardware adapter ID
-    UINT16   vendor_id;             // PCI vendor ID (0x15B3 = Mellanox)
-    UINT16   device_id;            // PCI device ID
-    UINT32   max_transfer_mb;      // max single-transfer size (MiB)
-    UINT32   max_inline_data;      // max inline data (bytes)
-    UINT32   max_cq_depth;         // max completion queue depth
-    UINT32   max_initiator_depth;  // max initiator queue depth
-    UINT32   flags;                // raw ND2_ADAPTER_INFO.AdapterFlags
-    int      has_in_order_dma;     // supports in-order DMA
-    int      has_multi_engine;     // multi-QP parallel supported
-    int      has_loopback;         // loopback connections supported
-} rdma_adapter_info;
-
-int rdma_list_adapters(
-    rdma_adapter_info* info,       // NULL to get count
-    int                max_count   // size of info array
-);
-```
-
-枚举系统上所有 RDMA 网卡。同时返回每个适配器的硬件能力和特性标志。
-
-- **返回值**：找到的适配器数量，或 `-1` 出错
-- **用法**：先 `rdma_list_adapters(NULL, 0)` 获取数量，再分配数组调用第二次
-- **内部操作**：`NdQueryAddressList` → 遍历每个地址 → `NdOpenAdapter` → `Query` → 填充结构体
-
-**示例**：
-
-```cpp
 rdma_transfer_init();
 
 int n = rdma_list_adapters(NULL, 0);
-rdma_adapter_info* list = (rdma_adapter_info*)calloc(n, sizeof(*list));
+rdma_adapter_info* list = calloc(n, sizeof(*list));
 rdma_list_adapters(list, n);
 
-for (int i = 0; i < n; i++) {
-    printf("[%d] %s  max_xfer=%uMB  loopback=%d  multi_eng=%d\n",
-           i, list[i].ip_address,
-           list[i].max_transfer_mb,
-           list[i].has_loopback,
-           list[i].has_multi_engine);
-}
+for (int i = 0; i < n; i++)
+    printf("[%d] %s  max=%uMB  loopback=%d\n",
+           i, list[i].ip_address, list[i].max_transfer_mb, list[i].has_loopback);
+
 free(list);
+rdma_transfer_cleanup();
 ```
+
+### 多线程取消
+
+```c
+// 传输线程
+rdma_transfer_init();
+rdma_send_file("192.168.100.2", 54321, L"D:\\big.bin"); // 阻塞
+rdma_transfer_cleanup();
+
+// 用户点了取消按钮 → 另一个线程调用
+rdma_transfer_cancel();  // 传输线程立即返回 -1
+```
+
+---
+
+## 返回值约定
+
+| 返回值 | 含义 |
+|---|---|
+| `0` | 成功 |
+| `-1` | 失败 (传输错误 / 被取消) |
+| `> 0` | 仅 `rdma_list_adapters`: 适配器数量 |
 
 ---
 
 ## 限制
 
-- 仅支持 IPv4 (RoCE v2)
-- 仅支持 x64 平台
+- 仅 IPv4 (RoCE v2)
+- 仅 x64
 - 单线程、单 QP
-- 与 ndutil.lib 静态链接 (/MT)
-- 需要 Visual Studio 2022+ 运行时
+- 静态链接 CRT (`/MT`)
+- 需要 VC++ 2022+ 运行时
