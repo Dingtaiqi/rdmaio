@@ -86,21 +86,42 @@ static HRESULT WaitOverlapped(IND2Overlapped* pObj, OVERLAPPED* pOv) {
 
 static void CleanupNd(NdContext& ctx) {
     HRESULT hr;
-    if (ctx.pMr)       { hr = ctx.pMr->Deregister(&ctx.ov);
-                         if (hr == ND_PENDING) ctx.pMr->GetOverlappedResult(&ctx.ov, TRUE); }
-    if (ctx.pConnector){ hr = ctx.pConnector->Disconnect(&ctx.ov);
-                         if (hr == ND_PENDING) ctx.pConnector->GetOverlappedResult(&ctx.ov, TRUE); }
-    if (ctx.pQp)       { ctx.pQp->Release();       ctx.pQp       = nullptr; }
-    if (ctx.pConnector){ ctx.pConnector->Release();ctx.pConnector= nullptr; }
-    if (ctx.pMr)       { ctx.pMr->Release();       ctx.pMr       = nullptr; }
-    // Flush providers to ensure the kernel ND driver has fully released
-    // hardware QP resources before a new connection is made.
-    NdFlushProviders();
-    if (ctx.pCq)       { ctx.pCq->Release();       ctx.pCq       = nullptr; }
-    if (ctx.pListener) { ctx.pListener->Release(); ctx.pListener  = nullptr; }
-    if (ctx.hOvFile != INVALID_HANDLE_VALUE)       { CloseHandle(ctx.hOvFile); ctx.hOvFile = INVALID_HANDLE_VALUE; }
-    if (ctx.pAdapter)  { ctx.pAdapter->Release();  ctx.pAdapter  = nullptr; }
-    if (ctx.ov.hEvent) { CloseHandle(ctx.ov.hEvent); ctx.ov.hEvent= nullptr; }
+    // 复用自 D:\rdma\NetworkDirect\src\examples\ndtestutil\ndtestutil.cpp 的析构与 Shutdown 顺序，
+    // 并按要求调整为：DeregisterMemory -> Disconnect -> CloseCQ -> CloseAdapter -> NdCleanup。
+    if (ctx.pMr != nullptr)
+    {
+        hr = ctx.pMr->Deregister(&ctx.ov);
+        if (hr == ND_PENDING)
+        {
+            ctx.pMr->GetOverlappedResult(&ctx.ov, TRUE);
+        }
+    }
+
+    if (ctx.pConnector != nullptr)
+    {
+        hr = ctx.pConnector->Disconnect(&ctx.ov);
+        if (hr == ND_PENDING)
+        {
+            ctx.pConnector->GetOverlappedResult(&ctx.ov, TRUE);
+        }
+    }
+
+    if (ctx.pQp != nullptr)       { ctx.pQp->Release();       ctx.pQp = nullptr; }
+    if (ctx.pCq != nullptr)       { ctx.pCq->Release();       ctx.pCq = nullptr; }
+    if (ctx.pConnector != nullptr){ ctx.pConnector->Release();ctx.pConnector = nullptr; }
+    if (ctx.pListener != nullptr) { ctx.pListener->Release(); ctx.pListener = nullptr; }
+    if (ctx.pMr != nullptr)       { ctx.pMr->Release();       ctx.pMr = nullptr; }
+    if (ctx.hOvFile != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(ctx.hOvFile);
+        ctx.hOvFile = INVALID_HANDLE_VALUE;
+    }
+    if (ctx.pAdapter != nullptr)  { ctx.pAdapter->Release();  ctx.pAdapter = nullptr; }
+    if (ctx.ov.hEvent != nullptr)
+    {
+        CloseHandle(ctx.ov.hEvent);
+        ctx.ov.hEvent = nullptr;
+    }
 }
 
 static int ParseIpv4(const char* ipStr, USHORT port, struct sockaddr_in* pAddr) {
@@ -284,10 +305,6 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
 
             LARGE_INTEGER tn; QueryPerformanceCounter(&tn);
             FireProgress(bytesSent, fileSize, (double)(tn.QuadPart - t0.QuadPart) / (double)freq.QuadPart);
-            // Yield CPU to the receiver process so it can process CQ completions.
-            // Both processes busy-wait on the same machine — without yielding,
-            // the receiver may starve and miss its repost window.
-            SwitchToThread();
         }
 
         LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
