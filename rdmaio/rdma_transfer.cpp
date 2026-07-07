@@ -101,6 +101,10 @@ static void CleanupNd(NdContext& ctx) {
     if (ctx.hOvFile != INVALID_HANDLE_VALUE)       { CloseHandle(ctx.hOvFile); ctx.hOvFile = INVALID_HANDLE_VALUE; }
     if (ctx.pAdapter)  { ctx.pAdapter->Release();  ctx.pAdapter  = nullptr; }
     if (ctx.ov.hEvent) { CloseHandle(ctx.ov.hEvent); ctx.ov.hEvent= nullptr; }
+    // Let the ND kernel driver finish async teardown before we return.
+    // Without this, a fast reconnect can hit a hardware QP that is still
+    // being dismantled, causing RNR timeouts on the new connection.
+    Sleep(100);
 }
 
 static int ParseIpv4(const char* ipStr, USHORT port, struct sockaddr_in* pAddr) {
