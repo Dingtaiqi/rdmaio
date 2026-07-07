@@ -24,8 +24,8 @@
 #pragma comment(lib, "Ws2_32.lib")
 
 static const DWORD CHUNK_SIZE   = 4 * 1024 * 1024;
-static const DWORD CQ_DEPTH     = 256;
-static const DWORD QP_DEPTH     = 128;
+static const DWORD CQ_DEPTH     = 512;
+static const DWORD QP_DEPTH     = 256;   // deep recv queue to cover sender speed advantage
 static const DWORD ALIGNMENT    = 4096;
 
 #define META_SEND_CTX   ((void*)0x1001)
