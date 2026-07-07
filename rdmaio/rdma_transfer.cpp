@@ -281,6 +281,7 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
 
     if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
     FreeAligned(pBuf);
+    ResetCancel();
     CleanupNd(ctx);
     return ret;
 }
@@ -449,6 +450,7 @@ static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath
 
     if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
     FreeAligned(pBuf);
+    ResetCancel();
     CleanupNd(ctx);
     return ret;
 }
@@ -527,12 +529,14 @@ static int InternalBenchRecv(const char* localIp, USHORT port, int sizeMb) {
         while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
     } while (0);
     FreeAligned(pBuf);
+    ResetCancel();
     CleanupNd(ctx);
     return ret;
 }
 
 static int InternalBenchSend(const char* remoteIp, USHORT port, int sizeMb) {
     int ret = 0; NdContext ctx; void* pBuf = nullptr;
+    ResetCancel();
 
     struct sockaddr_in remoteAddr = {};
     if (ParseIpv4(remoteIp, port, &remoteAddr) != 0) return -1;
@@ -643,6 +647,7 @@ static int InternalBenchSend(const char* remoteIp, USHORT port, int sizeMb) {
     } while (0);
 
     FreeAligned(pBuf);
+    ResetCancel();
     CleanupNd(ctx);
     return ret;
 }
