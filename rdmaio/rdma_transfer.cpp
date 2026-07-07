@@ -239,6 +239,7 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
         ND2_RESULT result = {}; bool metaDone = false;
         while (!metaDone) {
             while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
+            if (IsCancelled()) { ret = -1; break; }
             if (result.Status != ND_SUCCESS) { ret = -1; break; }
             if (result.RequestContext == META_SEND_CTX) metaDone = true;
         }
@@ -264,6 +265,7 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
             bool sendDone = false;
             while (!sendDone && !aborted) {
                 while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
+                if (IsCancelled()) { ret = -1; break; }
                 if (result.Status != ND_SUCCESS) { ret = -1; break; }
                 if (result.RequestContext == CHUNK_SEND_CTX)      { sendDone = true; bytesSent += toRead; }
                 else if (result.RequestContext == TERM_RECV_CTX)  { if (pTerm->cmd == TERM_CMD_ABORT) { aborted = true; ret = -1; } }
@@ -388,6 +390,7 @@ static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath
         ND2_RESULT result = {}; bool metaDone = false;
         while (!metaDone) {
             while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
+            if (IsCancelled()) { ret = -1; break; }
             if (result.Status != ND_SUCCESS) { ret = -1; break; }
             if (result.RequestContext == META_RECV_CTX) metaDone = true;
         }
@@ -414,6 +417,7 @@ static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath
         while (bytesReceived < fileSize && !diskError) {
             if (IsCancelled()) { ret = -1; diskError = true; break; }
             while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
+            if (IsCancelled()) { ret = -1; diskError = true; break; }
             if (result.Status != ND_SUCCESS || result.RequestContext != CHUNK_RECV_CTX) {
                 ret = -1; diskError = true; break;
             }
