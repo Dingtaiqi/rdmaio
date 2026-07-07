@@ -70,6 +70,31 @@ typedef void (*rdma_progress_cb)(double percent, double speed_mbps, void* user_d
 // Pass NULL to disable.
 RDMA_TRANSFER_API void rdma_set_progress_callback(rdma_progress_cb cb, void* user_data);
 
+// ---- Metadata Callback ---------------------------------------------------
+// Called on the receiver side when the sender's metadata arrives.
+//   filename  — original file name (ANSI, null-terminated)
+//   file_size — total file size in bytes
+//   user_data — opaque pointer passed to rdma_set_metadata_callback
+typedef void (*rdma_metadata_cb)(const char* filename, uint64_t file_size, void* user_data);
+
+RDMA_TRANSFER_API void rdma_set_metadata_callback(rdma_metadata_cb cb, void* user_data);
+
+// ---- Cancel --------------------------------------------------------------
+// Cancel any in-progress rdma_send_file / rdma_recv_file / rdma_bench call
+// from another thread.  The blocked call will return -1.
+// Idempotent; safe to call when nothing is running.
+RDMA_TRANSFER_API void rdma_transfer_cancel(void);
+
+// ---- Metadata Callback ---------------------------------------------------
+// Called when file metadata is sent or received.
+//   filename  — original file name (null-terminated ANSI string)
+//   file_size — total file size in bytes
+// This allows the receiver to know the sender's file name before data arrives.
+typedef void (*rdma_metadata_cb)(const char* filename, uint64_t file_size, void* user_data);
+
+// Set a metadata callback.  Pass NULL to disable.
+RDMA_TRANSFER_API void rdma_set_metadata_callback(rdma_metadata_cb cb, void* user_data);
+
 // ---- Adapter Enumeration -------------------------------------------------
 // Info for one RDMA-capable adapter / address.
 typedef struct rdma_adapter_info {
