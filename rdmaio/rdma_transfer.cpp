@@ -24,8 +24,8 @@
 #pragma comment(lib, "Ws2_32.lib")
 
 static const DWORD CHUNK_SIZE   = 4 * 1024 * 1024;
-static const DWORD CQ_DEPTH     = 512;
-static const DWORD QP_DEPTH     = 256;   // deep recv queue to cover sender speed advantage
+static const DWORD CQ_DEPTH     = 256;
+static const DWORD QP_DEPTH     = 128;
 static const DWORD ALIGNMENT    = 4096;
 
 #define META_SEND_CTX   ((void*)0x1001)
@@ -470,7 +470,9 @@ static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath
             : std::wstring(outPath);
 
         hFile = CreateFileW(finalPath.c_str(), GENERIC_WRITE, 0, nullptr,
-                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                            CREATE_ALWAYS,
+                            FILE_FLAG_WRITE_THROUGH,
+                            nullptr);
         if (hFile == INVALID_HANDLE_VALUE) {
             sge_chunk.Buffer = pTerm; sge_chunk.BufferLength = sizeof(TerminateCmd);
             SendAbortSignal(ctx, sge_chunk, pTerm);
