@@ -301,6 +301,7 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
         if (FAILED(hr)) { ret = -1; break; }
 
         uint64_t bytesSent = 0; bool aborted = false;
+        DWORD send_count = 0;
         LARGE_INTEGER freq, t0; QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&t0);
 
         while (bytesSent < fileSize && !aborted) {
@@ -312,13 +313,21 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
             sge.Buffer = pChunk; sge.BufferLength = toRead;
             hr = ctx.pQp->Send(CHUNK_SEND_CTX, &sge, 1, 0);
             if (FAILED(hr)) { SET_ERROR("Send chunk failed"); ret = -1; break; }
+            send_count++;
+            if ((send_count % 32) == 0) {
+                char buf[64]; sprintf_s(buf, "SEND: posted %lu sends, bytesSent=%llu", send_count, bytesSent);
+                DbgLog(buf);
+            }
 
             bool sendDone = false;
             while (!sendDone && !aborted) {
                 while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
                 if (IsCancelled()) { SET_ERROR("Cancelled by user"); ret = -1; break; }
                 if (result.Status != ND_SUCCESS) {
-                    char buf[64]; sprintf_s(buf, "Chunk send CQ: 0x%08X", result.Status);
+                    char buf[64]; sprintf_s(buf, "SEND: chunk %lu CQ=0x%08X posted=%lu completed=%llu",
+                        send_count, result.Status, send_count, bytesSent);
+                    DbgLog(buf);
+                    sprintf_s(buf, "Chunk send CQ: 0x%08X", result.Status);
                     SET_ERROR(buf); ret = -1; break;
                 }
                 if (result.RequestContext == CHUNK_SEND_CTX)      { sendDone = true; bytesSent += toRead; }
