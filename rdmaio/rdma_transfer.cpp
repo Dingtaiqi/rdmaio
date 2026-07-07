@@ -70,7 +70,30 @@ static volatile LONG     g_cancel_flag  = 0;
 static LONG              g_init_count   = 0;
 static char              g_last_error[256] = "";
 
-#define SET_ERROR(msg) strcpy_s(g_last_error, sizeof(g_last_error), msg)
+#define SET_ERROR(msg) do { \
+    strcpy_s(g_last_error, sizeof(g_last_error), msg); \
+    DbgLog(msg); \
+} while(0)
+
+static void DbgLog(const char* msg) {
+    char buf[512];
+    SYSTEMTIME st; GetLocalTime(&st);
+    sprintf_s(buf, "%02d:%02d:%02d.%03d [%lu] %s\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        GetCurrentThreadId(), msg);
+    OutputDebugStringA(buf);
+    // Also write to rdma_dll.log next to the DLL
+    static char logPath[MAX_PATH] = "";
+    if (logPath[0] == 0) {
+        GetModuleFileNameA(NULL, logPath, MAX_PATH);
+        char* p = strrchr(logPath, '\\');
+        if (p) { p[1] = 0; }
+        strcat_s(logPath, "rdma_dll.log");
+    }
+    FILE* f = NULL;
+    fopen_s(&f, logPath, "a");
+    if (f) { fputs(buf, f); fclose(f); }
+}
 
 // ---- Helpers ------------------------------------------------------------
 static void* AllocAligned(size_t sz) {
@@ -342,6 +365,7 @@ static std::wstring BuildOutputPath(const wchar_t* outPath, const char* filename
 static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath) {
     int ret = 0; NdContext ctx; HANDLE hFile = INVALID_HANDLE_VALUE; void* pBuf = nullptr;
     ResetCancel();
+    DbgLog("RECV: start");
     const DWORD NUM_CHUNK_BUFS = QP_DEPTH - 1;
 
     struct sockaddr_in localAddr = {};
