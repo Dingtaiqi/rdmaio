@@ -140,7 +140,7 @@ static void SendAbortSignal(NdContext& ctx, ND2_SGE& sge, TerminateCmd* pTerm) {
     HRESULT hr = ctx.pQp->Send(TERM_SEND_CTX, &sge, 1, 0);
     if (FAILED(hr)) return;
     ND2_RESULT r = {};
-    while (ctx.pCq->GetResults(&r, 1) == 0) {}
+    while (ctx.pCq->GetResults(&r, 1) == 0 && !IsCancelled()) {}
 }
 
 static void ExtractFileName(const wchar_t* path, char* out, uint32_t* pLen, size_t maxLen) {
@@ -238,7 +238,7 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
 
         ND2_RESULT result = {}; bool metaDone = false;
         while (!metaDone) {
-            while (ctx.pCq->GetResults(&result, 1) == 0) {}
+            while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
             if (result.Status != ND_SUCCESS) { ret = -1; break; }
             if (result.RequestContext == META_SEND_CTX) metaDone = true;
         }
@@ -263,7 +263,7 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
 
             bool sendDone = false;
             while (!sendDone && !aborted) {
-                while (ctx.pCq->GetResults(&result, 1) == 0) {}
+                while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
                 if (result.Status != ND_SUCCESS) { ret = -1; break; }
                 if (result.RequestContext == CHUNK_SEND_CTX)      { sendDone = true; bytesSent += toRead; }
                 else if (result.RequestContext == TERM_RECV_CTX)  { if (pTerm->cmd == TERM_CMD_ABORT) { aborted = true; ret = -1; } }
@@ -386,7 +386,7 @@ static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath
 
         ND2_RESULT result = {}; bool metaDone = false;
         while (!metaDone) {
-            while (ctx.pCq->GetResults(&result, 1) == 0) {}
+            while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
             if (result.Status != ND_SUCCESS) { ret = -1; break; }
             if (result.RequestContext == META_RECV_CTX) metaDone = true;
         }
@@ -412,7 +412,7 @@ static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath
 
         while (bytesReceived < fileSize && !diskError) {
             if (IsCancelled()) { ret = -1; diskError = true; break; }
-            while (ctx.pCq->GetResults(&result, 1) == 0) {}
+            while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
             if (result.Status != ND_SUCCESS || result.RequestContext != CHUNK_RECV_CTX) {
                 ret = -1; diskError = true; break;
             }
@@ -518,13 +518,13 @@ static int InternalBenchRecv(const char* localIp, USHORT port, int sizeMb) {
         if (FAILED(hr)) { ret = -1; break; }
 
         ND2_RESULT result = {};
-        while (ctx.pCq->GetResults(&result, 1) == 0) {}
+        while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
         if (result.Status != ND_SUCCESS) { ret = -1; break; }
 
         // Wait for sender's terminate message
         hr = ctx.pQp->Receive((void*)0x5002, nullptr, 0);
         if (FAILED(hr)) { ret = -1; break; }
-        while (ctx.pCq->GetResults(&result, 1) == 0) {}
+        while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
     } while (0);
     FreeAligned(pBuf);
     CleanupNd(ctx);
@@ -598,7 +598,7 @@ static int InternalBenchSend(const char* remoteIp, USHORT port, int sizeMb) {
 
         // Receive peer info from receiver (its memory token + address)
         ND2_RESULT result = {};
-        while (ctx.pCq->GetResults(&result, 1) == 0) {}
+        while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
         if (result.Status != ND_SUCCESS) { ret = -1; break; }
         // pPeer now holds receiver's memory info
 
@@ -623,7 +623,7 @@ static int InternalBenchSend(const char* remoteIp, USHORT port, int sizeMb) {
         }
 
         if (ret == 0) {
-            while (ctx.pCq->GetResults(&result, 1) == 0) {}
+            while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
             if (result.Status != ND_SUCCESS) ret = -1;
         }
 
@@ -639,7 +639,7 @@ static int InternalBenchSend(const char* remoteIp, USHORT port, int sizeMb) {
 
         // Send terminate
         hr = ctx.pQp->Send((void*)0x5002, nullptr, 0, 0);
-        if (SUCCEEDED(hr)) while (ctx.pCq->GetResults(&result, 1) == 0) {}
+        if (SUCCEEDED(hr)) while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
     } while (0);
 
     FreeAligned(pBuf);
