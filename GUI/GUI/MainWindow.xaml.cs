@@ -424,6 +424,15 @@ namespace GUI
                     catch { /* best-effort */ }
                 }
 
+                // Force re-load file info next time so MD5 re-reads the file
+                // into OS cache — prevents disk-read latency from starving the
+                // receiver's receive queue on retry.
+                if (!operationSucceeded)
+                {
+                    _currentFilePath = null;
+                    _currentFileSize = null;
+                }
+
                 _cts?.Dispose();
                 _cts = null;
                 SetRunning(false);

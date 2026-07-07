@@ -242,7 +242,8 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
         if (FAILED(hr)) { SET_ERROR("CompleteConnect failed"); ret = -1; break; }
 
         hFile = CreateFileW(filePath, GENERIC_READ, FILE_SHARE_READ,
-                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                            nullptr, OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
         if (hFile == INVALID_HANDLE_VALUE) { ret = -1; break; }
 
         LARGE_INTEGER fsLi;
