@@ -92,7 +92,7 @@ static void DbgLog(const char* msg) {
     }
     FILE* f = NULL;
     fopen_s(&f, logPath, "a");
-    if (f) { fputs(buf, f); fclose(f); }
+    if (f) { fputs(buf, f); fflush(f); fclose(f); }
 }
 
 // ---- Helpers ------------------------------------------------------------
@@ -366,7 +366,9 @@ static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath
     int ret = 0; NdContext ctx; HANDLE hFile = INVALID_HANDLE_VALUE; void* pBuf = nullptr;
     ResetCancel();
     DbgLog("RECV: start");
+    char tmp[128];
     const DWORD NUM_CHUNK_BUFS = QP_DEPTH - 1;
+    sprintf_s(tmp, "RECV: QP_DEPTH=%lu NUM_BUFS=%lu", (DWORD)QP_DEPTH, NUM_CHUNK_BUFS); DbgLog(tmp);
 
     struct sockaddr_in localAddr = {};
     if (ParseIpv4(localIp, port, &localAddr) != 0) return -1;
@@ -434,9 +436,10 @@ static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath
         for (DWORD i = 0; i < NUM_CHUNK_BUFS; i++) {
             sge_chunk.Buffer = chunkBufs[i]; sge_chunk.BufferLength = CHUNK_SIZE;
             hr = ctx.pQp->Receive(CHUNK_RECV_CTX, &sge_chunk, 1);
-            if (FAILED(hr)) { ret = -1; break; }
+            if (FAILED(hr)) { sprintf_s(tmp, "RECV: post recv[%lu] failed 0x%08X", i, hr); DbgLog(tmp); ret = -1; break; }
         }
         if (ret) break;
+        sprintf_s(tmp, "RECV: posted %lu chunk recvs", NUM_CHUNK_BUFS); DbgLog(tmp);
 
         hr = ctx.pConnector->Accept(ctx.pQp, 0, 0, nullptr, 0, &ctx.ov);
         if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
@@ -474,9 +477,14 @@ static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath
             while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
             if (IsCancelled()) { ret = -1; diskError = true; break; }
             if (result.Status != ND_SUCCESS || result.RequestContext != CHUNK_RECV_CTX) {
+                sprintf_s(tmp, "RECV: CQ error status=0x%08X ctx=%p bytesRecv=%llu",
+                    result.Status, result.RequestContext, bytesReceived); DbgLog(tmp);
                 ret = -1; diskError = true; break;
             }
             DWORD received = result.BytesTransferred;
+            if (bytesReceived == 0) {
+                sprintf_s(tmp, "RECV: first chunk arrived, bytes=%lu", received); DbgLog(tmp);
+            }
 
             if (bytesReceived + received < fileSize) {
                 DWORD nextExpect = (fileSize - (bytesReceived + received) > CHUNK_SIZE)
