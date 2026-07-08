@@ -315,7 +315,20 @@ namespace GUI
             {
                 Log("CANCEL requested");
                 StatusTextBlock.Text = "正在取消…";
-                RdmaTransfer.Cancel();
+
+                // For MemMon: use the cancel flag to unblock rdma_mem_wait,
+                // then cancel the CTS so the async loops exit cleanly.
+                // Do NOT call RdmaMemoryShare.Stop() here — that races with
+                // the native blocking call and the finally block handles cleanup.
+                if (ModeMemMonRadioButton.IsChecked == true)
+                {
+                    RdmaNative.rdma_transfer_cancel();
+                }
+                else
+                {
+                    RdmaTransfer.Cancel();
+                }
+
                 _cts.Cancel();
             }
         }
@@ -333,12 +346,14 @@ namespace GUI
                 return;
             }
 
-            // Determine IP: receiver (file or benchmark) uses selected adapter IP;
-            // sender / benchmark sender uses the text box.
+            // Determine IP: receiver / display uses selected adapter IP;
+            // sender / writer uses the text box.
             string ip;
             bool isReceiver = ModeReceiveRadioButton.IsChecked == true ||
                               (ModeBenchmarkRadioButton.IsChecked == true &&
-                               BenchmarkSideReceiverRadioButton.IsChecked == true);
+                               BenchmarkSideReceiverRadioButton.IsChecked == true) ||
+                              (ModeMemMonRadioButton.IsChecked == true &&
+                               MemMonSideDisplayButton.IsChecked == true);
             if (isReceiver)
             {
                 ip = adapter.IpAddress;
@@ -501,10 +516,12 @@ namespace GUI
 
                     if (isWriter)
                     {
-                        // Writer mode — user writes via text box, we just wait
+                        // Writer mode — stay connected until user cancels
                         StatusTextBlock.Text = $"已连接到 {ip}:{port}，在下方输入数据后点击「写入」";
                         MemMonHexText.Text = $"已连接，缓冲区大小: {RdmaMemoryShare.BufferSize} 字节\n输入数据并点击「写入」以通过 RDMA Write 发送";
                         Log("MEM: writer ready");
+                        // Wait for cancellation (exception propagates to outer handler)
+                        await Task.Delay(-1, ct);
                     }
                     else
                     {
@@ -620,55 +637,99 @@ namespace GUI
 
         /// <summary>
         /// Display-side update loop: waits for doorbells and refreshes the hex view.
+        /// OperationCanceledException is deliberately NOT caught here — it propagates
+        /// to StartButton_Click's catch block which sets status to "操作已取消。"
         /// </summary>
         private async Task RunDisplayUpdateLoopAsync(CancellationToken ct)
         {
-            try
+            int updateCount = 0;
+            while (!ct.IsCancellationRequested)
             {
-                int updateCount = 0;
-                while (!ct.IsCancellationRequested)
+                bool updated = await RdmaMemoryShare.WaitForUpdateAsync(1000, ct);
+                if (ct.IsCancellationRequested) break;
+                if (updated)
                 {
-                    bool updated = await RdmaMemoryShare.WaitForUpdateAsync(1000, ct);
-                    if (ct.IsCancellationRequested) break;
-                    if (updated)
-                    {
-                        var (off, len) = RdmaMemoryShare.GetLastWriteInfo();
-                        updateCount++;
-                        Log($"MEM: update #{updateCount} offset={off} length={len}");
+                    var (off, len) = RdmaMemoryShare.GetLastWriteInfo();
+                    updateCount++;
+                    Log($"MEM: update #{updateCount} offset={off} length={len}");
 
+                    byte[]? snapshot = null;
+                    if (RdmaMemoryShare.BufferPtr != IntPtr.Zero)
+                    {
+                        uint size = Math.Min(RdmaMemoryShare.BufferSize, 256);
+                        snapshot = new byte[size];
+                        Marshal.Copy(RdmaMemoryShare.BufferPtr, snapshot, 0, (int)size);
+                    }
+
+                    DispatcherQueue.TryEnqueue(() =>
+                    {
+                        if (snapshot != null)
+                            MemMonHexText.Text = FormatHexDumpFromCopy(snapshot, RdmaMemoryShare.BufferSize, 0);
+                        MemMonStatusText.Text = $"更新 #{updateCount} | 偏移={off} | 长度={len} "
+                            + $"| 缓冲区={RdmaMemoryShare.BufferSize} 字节";
+                        TransferProgressBar.Value = 100;
+                    });
+                }
+                else
+                {
+                    if (updateCount > 0)
+                    {
+                        byte[]? snapshot = null;
+                        if (RdmaMemoryShare.BufferPtr != IntPtr.Zero)
+                        {
+                            uint size = Math.Min(RdmaMemoryShare.BufferSize, 256);
+                            snapshot = new byte[size];
+                            Marshal.Copy(RdmaMemoryShare.BufferPtr, snapshot, 0, (int)size);
+                        }
                         DispatcherQueue.TryEnqueue(() =>
                         {
-                            MemMonHexText.Text = FormatHexDump(RdmaMemoryShare.BufferPtr,
-                                                               RdmaMemoryShare.BufferSize, 0, 256);
-                            MemMonStatusText.Text = $"更新 #{updateCount} | 偏移={off} | 长度={len} "
-                                + $"| 缓冲区={RdmaMemoryShare.BufferSize} 字节";
-                            TransferProgressBar.Value = 100;
+                            if (snapshot != null)
+                                MemMonHexText.Text = FormatHexDumpFromCopy(snapshot, RdmaMemoryShare.BufferSize, 0);
                         });
-                    }
-                    else
-                    {
-                        // Timeout — heartbeat to keep UI responsive
-                        if (updateCount > 0)
-                        {
-                            DispatcherQueue.TryEnqueue(() =>
-                            {
-                                MemMonHexText.Text = FormatHexDump(RdmaMemoryShare.BufferPtr,
-                                                                   RdmaMemoryShare.BufferSize, 0, 256);
-                            });
-                        }
                     }
                 }
             }
-            catch (OperationCanceledException) { }
-            catch (Exception ex)
+
+            Log("MEM: display loop ended");
+        }
+
+        /// <summary>
+        /// Format a hex dump from a byte array copy (safe — no native pointer needed after copy).
+        /// </summary>
+        private static string FormatHexDumpFromCopy(byte[] buf, uint totalSize, uint startOffset)
+        {
+            if (buf == null || buf.Length == 0 || totalSize == 0) return "(无数据)";
+
+            var sb = new System.Text.StringBuilder(buf.Length / 16 * 80 + 100);
+            sb.AppendLine($"共享内存 | 共 {totalSize} 字节 | 显示前 {buf.Length} 字节");
+            sb.AppendLine(new string('-', 80));
+
+            int rows = (buf.Length + 15) / 16;
+            for (int r = 0; r < rows; r++)
             {
-                Log($"MEM: display loop error: {ex.Message}");
-                DispatcherQueue.TryEnqueue(() => ShowError($"监控循环错误：{ex.Message}"));
+                int offset = r * 16;
+                sb.Append($"{startOffset + (uint)offset:X8}  ");
+                for (int c = 0; c < 16; c++)
+                {
+                    int idx = offset + c;
+                    if (idx < buf.Length)
+                        sb.Append($"{buf[idx]:X2} ");
+                    else
+                        sb.Append("   ");
+                    if (c == 7) sb.Append(" ");
+                }
+                sb.Append(" |");
+                for (int c = 0; c < 16; c++)
+                {
+                    int idx = offset + c;
+                    if (idx < buf.Length)
+                        sb.Append(buf[idx] >= 32 && buf[idx] < 127 ? (char)buf[idx] : '.');
+                    else
+                        sb.Append(' ');
+                }
+                sb.AppendLine("|");
             }
-            finally
-            {
-                Log("MEM: display loop ended");
-            }
+            return sb.ToString();
         }
 
         /// <summary>

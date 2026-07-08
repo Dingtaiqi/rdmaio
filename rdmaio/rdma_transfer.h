@@ -7,6 +7,8 @@
 //
 #pragma once
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -91,16 +93,6 @@ RDMA_TRANSFER_API const char* rdma_transfer_last_error(void);
 // Idempotent; safe to call when nothing is running.
 RDMA_TRANSFER_API void rdma_transfer_cancel(void);
 
-// ---- Metadata Callback ---------------------------------------------------
-// Called when file metadata is sent or received.
-//   filename  — original file name (null-terminated ANSI string)
-//   file_size — total file size in bytes
-// This allows the receiver to know the sender's file name before data arrives.
-typedef void (*rdma_metadata_cb)(const char* filename, uint64_t file_size, void* user_data);
-
-// Set a metadata callback.  Pass NULL to disable.
-RDMA_TRANSFER_API void rdma_set_metadata_callback(rdma_metadata_cb cb, void* user_data);
-
 // ---- Adapter Enumeration -------------------------------------------------
 // Info for one RDMA-capable adapter / address.
 typedef struct rdma_adapter_info {
@@ -126,6 +118,48 @@ typedef struct rdma_adapter_info {
 RDMA_TRANSFER_API int rdma_list_adapters(
     rdma_adapter_info* info,
     int                max_count);
+
+// ---- Shared Memory Monitor --------------------------------------------------
+// Display (receiver): allocates buffer, sender RDMA Writes data into it in real-time.
+// Writer (sender):    RDMA Writes data + doorbell, receiver sees data change instantly.
+//
+// Usage:
+//   Display side: rdma_mem_start(0, ip, port, size) → rdma_mem_buffer() → rdma_mem_wait() loop → rdma_mem_stop()
+//   Writer side:  rdma_mem_start(1, ip, port, size) → rdma_mem_write(offset, data, len) loop → rdma_mem_stop()
+
+// Start a shared memory session.
+//   mode:  0 = display (receiver, owns the buffer), 1 = writer (sender, writes into buffer)
+//   ip/port: connection parameters (display's IP for mode=0, writer connects to it)
+//   size_bytes: size of the shared memory buffer
+// Returns 0 on success, -1 on error.
+RDMA_TRANSFER_API int rdma_mem_start(int mode, const char* ip, unsigned short port, unsigned int size_bytes);
+
+// Writer: write data into the remote shared buffer at given offset.
+//   offset: byte offset from start of shared buffer
+//   data: source data pointer (len bytes will be copied internally)
+//   len: number of bytes to write
+// The function RDMA Writes data then sends a doorbell so the display side sees the update.
+// Returns 0 on success, -1 on error.
+RDMA_TRANSFER_API int rdma_mem_write(unsigned int offset, const void* data, unsigned int len);
+
+// Display: get a read-only pointer to the local shared buffer.
+// Returns pointer to the buffer (size_bytes bytes), or NULL if not started.
+// After rdma_mem_wait() returns, the buffer has new data.
+RDMA_TRANSFER_API const void* rdma_mem_buffer(void);
+
+// Display: get the buffer size.
+RDMA_TRANSFER_API unsigned int rdma_mem_size(void);
+
+// Display: block until the next doorbell (data update) arrives.
+//   timeout_ms: timeout in milliseconds (0 = infinite, -1 = non-blocking check)
+// Returns: 1 if new data arrived, 0 on timeout, -1 on error.
+RDMA_TRANSFER_API int rdma_mem_wait(int timeout_ms);
+
+// Get the offset and length of the last write.
+RDMA_TRANSFER_API void rdma_mem_last_write(unsigned int* out_offset, unsigned int* out_len);
+
+// Stop the shared memory session and release all resources.
+RDMA_TRANSFER_API void rdma_mem_stop(void);
 
 #ifdef __cplusplus
 }

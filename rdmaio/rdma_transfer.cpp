@@ -1,4 +1,11 @@
-// rdma_transfer.cpp — DLL implementation of RDMA file transfer over NDSPI
+// rdma_transfer.cpp — RDMA Write file transfer over NDSPI with credit-based flow control
+//
+// Architecture:
+//   Data:  Sender RDMA Writes chunks into receiver's ring buffer.
+//          Receiver CPU is NEVER touched during data arrival.
+//   Ctrl:  Doorbell (Send)  — sender → receiver: "slot X has Y bytes"
+//          Credit   (Send)  — receiver → sender: "slot X is free, reuse it"
+//   Flow:  Credits provide natural backpressure — sender never overwhelms receiver.
 //
 // Build: /D RDMA_TRANSFER_EXPORTS to export symbols
 
@@ -23,21 +30,30 @@
 
 #pragma comment(lib, "Ws2_32.lib")
 
-static const DWORD CHUNK_SIZE   = 2 * 1024 * 1024;      // 2 MiB chunks
+// ---- Constants ---------------------------------------------------------
+static const DWORD CHUNK_SIZE   = 4 * 1024 * 1024;   // 4 MiB chunks
 static const DWORD CQ_DEPTH     = 1024;
-static const DWORD QP_DEPTH     = 512;   // deep enough to never wrap for <1GB files at 2MB chunks
+static const DWORD QP_DEPTH     = 512;                 // covers send + recv depth
 static const DWORD ALIGNMENT    = 4096;
+static const DWORD NUM_SLOTS    = 256;                 // ring buffer depth (power of 2, 256×4MB=1GB)
+static const uint32_t SLOT_MASK = NUM_SLOTS - 1;
 
-#define META_SEND_CTX   ((void*)0x1001)
-#define META_RECV_CTX   ((void*)0x1002)
-#define CHUNK_SEND_CTX  ((void*)0x2001)
-#define CHUNK_RECV_CTX  ((void*)0x2002)
-#define TERM_SEND_CTX   ((void*)0x3001)
-#define TERM_RECV_CTX   ((void*)0x3002)
+// CQ completion context IDs — all < 0x1000 (avoids benchmark IDs 0x4001-0x6001)
+#define META_SEND_CTX        ((void*)0x0001)
+#define META_RECV_CTX        ((void*)0x0002)
+#define SLOTINFO_SEND_CTX    ((void*)0x0101)
+#define SLOTINFO_RECV_CTX    ((void*)0x0102)
+#define CHUNK_WRITE_CTX      ((void*)0x0201)
+#define DOORBELL_SEND_CTX    ((void*)0x0301)
+#define CREDIT_SEND_CTX      ((void*)0x0501)
+#define DONE_SEND_CTX        ((void*)0x0801)
+#define DONE_RECV_CTX        ((void*)0x0802)
+#define ABORT_SLOT_MARKER    UINT32_MAX
+
+// Benchmark IDs (keep unchanged, must not overlap with above)
 #define PEER_SEND_CTX   ((void*)0x4001)
 #define PEER_RECV_CTX   ((void*)0x4002)
 #define BENCH_WRITE_CTX ((void*)0x6001)
-#define TERM_CMD_ABORT  0xDEADBEEFUL
 
 #pragma pack(push, 1)
 struct FileMeta {
@@ -45,9 +61,23 @@ struct FileMeta {
     uint32_t filename_len;
     char     filename[256];
 };
+
+struct SlotInfo {
+    UINT64   base_addr;
+    UINT32   remote_token;
+    uint32_t num_slots;
+};
+
+struct DoorbellMsg {
+    uint32_t slot_index;
+    uint32_t data_size;         // actual data size (may be < CHUNK_SIZE for last chunk)
+};
+
+struct CreditMsg {
+    uint32_t slot_index;        // slot now free; ABORT_SLOT_MARKER = disk error
+};
 #pragma pack(pop)
 
-struct TerminateCmd  { uint32_t cmd; };
 struct BenchPeerInfo { UINT64 remoteAddress; UINT32 remoteToken; };
 
 struct NdContext {
@@ -108,6 +138,13 @@ static void* AllocAligned(size_t sz) {
     return p;
 }
 static void FreeAligned(void* p) { if (p) _aligned_free(p); }
+static void* AllocLarge(size_t sz) {
+    // VirtualAlloc is better for large DMA buffers than _aligned_malloc
+    void* p = VirtualAlloc(NULL, sz, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (p) memset(p, 0, sz);
+    return p;
+}
+static void FreeLarge(void* p) { if (p) VirtualFree(p, 0, MEM_RELEASE); }
 
 static HRESULT WaitOverlapped(IND2Overlapped* pObj, OVERLAPPED* pOv) {
     return pObj->GetOverlappedResult(pOv, TRUE);
@@ -189,16 +226,6 @@ static void ResetCancel(void) {
     InterlockedExchange(&g_cancel_flag, 0);
 }
 
-static void SendAbortSignal(NdContext& ctx, ND2_SGE& sge, TerminateCmd* pTerm) {
-    pTerm->cmd = TERM_CMD_ABORT;
-    sge.Buffer = pTerm;
-    sge.BufferLength = sizeof(TerminateCmd);
-    HRESULT hr = ctx.pQp->Send(TERM_SEND_CTX, &sge, 1, 0);
-    if (FAILED(hr)) return;
-    ND2_RESULT r = {};
-    while (ctx.pCq->GetResults(&r, 1) == 0 && !IsCancelled()) {}
-}
-
 static void ExtractFileName(const wchar_t* path, char* out, uint32_t* pLen, size_t maxLen) {
     const wchar_t* name = wcsrchr(path, L'\\');
     if (!name) name = wcsrchr(path, L'/');
@@ -208,10 +235,11 @@ static void ExtractFileName(const wchar_t* path, char* out, uint32_t* pLen, size
 }
 
 // ===================================================================
-// Internal transfer functions
+// RDMA Write file transfer — sender
 // ===================================================================
 static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePath) {
-    int ret = 0; NdContext ctx; HANDLE hFile = INVALID_HANDLE_VALUE; void* pBuf = nullptr;
+    int ret = 0; NdContext ctx; HANDLE hFile = INVALID_HANDLE_VALUE;
+    void* pBuf = nullptr;
     ResetCancel();
 
     struct sockaddr_in remoteAddr = {};
@@ -246,17 +274,33 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
     hr = ctx.pAdapter->CreateMemoryRegion(IID_IND2MemoryRegion, ctx.hOvFile, (void**)&ctx.pMr);
     if (FAILED(hr)) { CleanupNd(ctx); return -1; }
 
-    const size_t bufSize = (size_t)CHUNK_SIZE + 8192;
-    pBuf = AllocAligned(bufSize);
+    // --- Sender memory layout (one MR) ---
+    //  [0 .. sizeof(FileMeta)]         : FileMeta to send
+    //  [ALIGNMENT .. ALIGNMENT+CHUNK_SIZE] : local chunk buffer (ReadFile target + Write source)
+    //  [ALIGNMENT+CHUNK_SIZE .. +sizeof(DoorbellMsg)] : doorbell send buffer
+    //  [+sizeof(DoorbellMsg) .. +sizeof(SlotInfo)] : slot info recv buffer
+    //  [+sizeof(SlotInfo) .. +NUM_SLOTS*sizeof(CreditMsg)] : credit recv ring
+    //  [+NUM_SLOTS*sizeof(CreditMsg) .. +sizeof(uint32_t)] : done recv buffer
+    size_t sendBufSize = ALIGNMENT + CHUNK_SIZE + sizeof(DoorbellMsg) + sizeof(SlotInfo)
+                       + NUM_SLOTS * sizeof(CreditMsg) + sizeof(uint32_t);
+    pBuf = AllocAligned(sendBufSize);
     if (!pBuf) { CleanupNd(ctx); return -1; }
 
-    hr = ctx.pMr->Register(pBuf, bufSize, ND_MR_FLAG_ALLOW_LOCAL_WRITE, &ctx.ov);
+    hr = ctx.pMr->Register(pBuf, sendBufSize, ND_MR_FLAG_ALLOW_LOCAL_WRITE, &ctx.ov);
     if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pMr, &ctx.ov);
-    if (FAILED(hr)) { SET_ERROR("Register buffer failed"); CleanupNd(ctx); return -1; }
+    if (FAILED(hr)) { SET_ERROR("Register send buffer failed"); CleanupNd(ctx); return -1; }
+    UINT32 localToken = ctx.pMr->GetLocalToken();
+
+    // Pointers into sender buffer
+    FileMeta*    pMeta     = (FileMeta*)pBuf;
+    char*        pChunk    = (char*)pBuf + ALIGNMENT;
+    DoorbellMsg* pDoorbell = (DoorbellMsg*)(pChunk + CHUNK_SIZE);
+    SlotInfo*    pSlotInfo = (SlotInfo*)(pDoorbell + 1);
+    CreditMsg*   creditRecvs = (CreditMsg*)(pSlotInfo + 1);
+    uint32_t*    pDoneBuf  = (uint32_t*)(creditRecvs + NUM_SLOTS);
 
     do {
-        UINT32 localToken = ctx.pMr->GetLocalToken();
-
+        // ---- Connect to receiver ------------------------------------------------
         hr = ctx.pConnector->Bind((const sockaddr*)&localAddr, sizeof(localAddr));
         if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
         if (FAILED(hr)) { SET_ERROR("Bind failed"); ret = -1; break; }
@@ -264,12 +308,25 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
         hr = ctx.pConnector->Connect(ctx.pQp, (const sockaddr*)&remoteAddr, sizeof(remoteAddr),
                                       0, 0, nullptr, 0, &ctx.ov);
         if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
-        if (FAILED(hr)) { SET_ERROR("Connect failed"); ret = -1; break; }
+        if (FAILED(hr)) { char b[64]; sprintf_s(b, "Connect failed: hr=0x%08X", hr); SET_ERROR(b); ret = -1; break; }
+
+        // Post Recv for SlotInfo (receiver's buffer details) BEFORE CompleteConnect
+        ND2_SGE slotInfoSge = {}; slotInfoSge.Buffer = pSlotInfo;
+        slotInfoSge.BufferLength = sizeof(SlotInfo); slotInfoSge.MemoryRegionToken = localToken;
+        hr = ctx.pQp->Receive(SLOTINFO_RECV_CTX, &slotInfoSge, 1);
+        if (FAILED(hr)) { ret = -1; break; }
+
+        // Post Recv for DONE (transfer-complete signal from receiver)
+        ND2_SGE doneSge = {}; doneSge.Buffer = pDoneBuf;
+        doneSge.BufferLength = sizeof(uint32_t); doneSge.MemoryRegionToken = localToken;
+        hr = ctx.pQp->Receive(DONE_RECV_CTX, &doneSge, 1);
+        if (FAILED(hr)) { ret = -1; break; }
 
         hr = ctx.pConnector->CompleteConnect(&ctx.ov);
         if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
         if (FAILED(hr)) { SET_ERROR("CompleteConnect failed"); ret = -1; break; }
 
+        // ---- Open file ---------------------------------------------------------
         hFile = CreateFileW(filePath, GENERIC_READ, FILE_SHARE_READ,
                             nullptr, OPEN_EXISTING,
                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
@@ -277,79 +334,246 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
 
         LARGE_INTEGER fsLi;
         if (!GetFileSizeEx(hFile, &fsLi)) { SET_ERROR("GetFileSizeEx failed"); ret = -1; break; }
-        const uint64_t fileSize = (uint64_t)fsLi.QuadPart;
+        uint64_t fileSize = (uint64_t)fsLi.QuadPart;
 
-        FileMeta*      pMeta  = (FileMeta*)pBuf;
-        char*          pChunk = (char*)pBuf + ALIGNMENT;
-        TerminateCmd*  pTerm  = (TerminateCmd*)(pChunk + CHUNK_SIZE);
-
+        // ---- Metadata exchange via Send/Recv -----------------------------------
+        // 1. Send FileMeta to receiver
         pMeta->file_size = fileSize;
         ExtractFileName(filePath, pMeta->filename, &pMeta->filename_len, sizeof(pMeta->filename));
-
         FireMetadata(pMeta->filename, fileSize);
+        char logBuf[128];
+        sprintf_s(logBuf, "SEND: sending %s (%llu bytes, %lu chunks)",
+            pMeta->filename, fileSize,
+            (ULONG)((fileSize + CHUNK_SIZE - 1) / CHUNK_SIZE));
+        DbgLog(logBuf);
 
-        ND2_SGE sge = {}; sge.Buffer = pMeta; sge.BufferLength = sizeof(FileMeta);
-        sge.MemoryRegionToken = localToken;
-        hr = ctx.pQp->Send(META_SEND_CTX, &sge, 1, 0);
+        ND2_SGE metaSge = {}; metaSge.Buffer = pMeta;
+        metaSge.BufferLength = sizeof(FileMeta); metaSge.MemoryRegionToken = localToken;
+        hr = ctx.pQp->Send(META_SEND_CTX, &metaSge, 1, 0);
         if (FAILED(hr)) { SET_ERROR("Send metadata failed"); ret = -1; break; }
+        ND2_RESULT cqResult = {};
+        while (ctx.pCq->GetResults(&cqResult, 1) == 0 && !IsCancelled()) {}
+        if (IsCancelled() || cqResult.Status != ND_SUCCESS) { ret = -1; break; }
 
-        ND2_RESULT result = {}; bool metaDone = false;
-        while (!metaDone) {
-            while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
-            if (IsCancelled()) { ret = -1; break; }
-            if (result.Status != ND_SUCCESS) { ret = -1; break; }
-            if (result.RequestContext == META_SEND_CTX) metaDone = true;
+        // 2. Wait for SlotInfo from receiver (remote buffer layout)
+        while (ctx.pCq->GetResults(&cqResult, 1) == 0 && !IsCancelled()) {}
+        if (IsCancelled() || cqResult.Status != ND_SUCCESS ||
+            cqResult.RequestContext != SLOTINFO_RECV_CTX) { ret = -1; break; }
+        UINT64 remoteBaseAddr = pSlotInfo->base_addr;
+        UINT32 remoteToken    = pSlotInfo->remote_token;
+        uint32_t remoteSlots  = pSlotInfo->num_slots;
+        if (remoteSlots < 1) { SET_ERROR("Receiver has no slots"); ret = -1; break; }
+        uint32_t usedSlots = min(remoteSlots, NUM_SLOTS);
+        sprintf_s(logBuf, "SEND: got slot info: base=0x%llX token=0x%X slots=%lu",
+            remoteBaseAddr, remoteToken, usedSlots);
+        DbgLog(logBuf);
+
+        // ---- Pre-post credit Recvs --------------------------------------------
+        // We need one Recv per slot to accept credit messages from receiver.
+        // Each credit Recv uses a unique context so we know which buf was filled.
+        // Place them AFTER the slotInfo + done recvs in the Recv queue.
+        ND2_SGE creditSge = {}; creditSge.MemoryRegionToken = localToken;
+        for (uint32_t i = 0; i < usedSlots; i++) {
+            creditSge.Buffer = &creditRecvs[i];
+            creditSge.BufferLength = sizeof(CreditMsg);
+            hr = ctx.pQp->Receive((void*)(uintptr_t)(0x2000 + i), &creditSge, 1);
+            if (FAILED(hr)) { SET_ERROR("Post credit Recv failed"); ret = -1; break; }
         }
         if (ret) break;
+        DbgLog("SEND: posted credit Recvs");
 
-        sge.Buffer = pTerm; sge.BufferLength = sizeof(TerminateCmd);
-        hr = ctx.pQp->Receive(TERM_RECV_CTX, &sge, 1);
-        if (FAILED(hr)) { ret = -1; break; }
+        // ---- Initialize free-slot tracking -------------------------------------
+        // At any point: freeCount = number of slots the sender may write to.
+        // Initially all slots are free. Each RDMA Write uses one; each credit returns one.
+        uint32_t freeSlots[NUM_SLOTS];
+        uint32_t freeHead = 0;
+        uint32_t freeCount = usedSlots;
+        for (uint32_t i = 0; i < usedSlots; i++) freeSlots[i] = i;
+        uint32_t bytesSent = 0;
 
-        uint64_t bytesSent = 0; bool aborted = false;
-        DWORD send_count = 0;
-        LARGE_INTEGER freq, t0; QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&t0);
+        // ---- RDMA Write data transfer loop -------------------------------------
+        LARGE_INTEGER freq, t0;
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&t0);
 
-        while (bytesSent < fileSize && !aborted) {
-            if (IsCancelled()) { ret = -1; aborted = true; break; }
-            DWORD toRead = (fileSize - bytesSent > CHUNK_SIZE) ? CHUNK_SIZE : (DWORD)(fileSize - bytesSent);
+        while (bytesSent < fileSize && ret == 0) {
+            // 1. Wait for a free slot (credit)
+            if (freeCount == 0) {
+                DbgLog("SEND: waiting for credit (all slots full)");
+                while (freeCount == 0 && ret == 0 && !IsCancelled()) {
+                    while (ctx.pCq->GetResults(&cqResult, 1) == 0 && !IsCancelled()) {}
+                    if (IsCancelled()) { ret = -1; break; }
+                    if (cqResult.Status == ND_SUCCESS &&
+                        (uintptr_t)cqResult.RequestContext >= 0x2000 &&
+                        (uintptr_t)cqResult.RequestContext < 0x2000 + usedSlots) {
+                        uint32_t bufIdx = (uint32_t)((uintptr_t)cqResult.RequestContext - 0x2000);
+                        uint32_t slotIdx = creditRecvs[bufIdx].slot_index;
+                        if (slotIdx == ABORT_SLOT_MARKER) {
+                            SET_ERROR("Receiver disk error");
+                            DbgLog("SEND: receiver reported disk error");
+                            ret = -1; break;
+                        }
+                        freeSlots[(freeHead + freeCount) & SLOT_MASK] = slotIdx;
+                        freeCount++;
+                        // Re-post credit Recv
+                        creditSge.Buffer = &creditRecvs[bufIdx];
+                        hr = ctx.pQp->Receive((void*)(uintptr_t)(0x2000 + bufIdx), &creditSge, 1);
+                        if (FAILED(hr)) { ret = -1; break; }
+                    } else if (cqResult.Status == ND_SUCCESS &&
+                               cqResult.RequestContext == DONE_RECV_CTX) {
+                        // Receiver sent DONE early — no more data to write
+                        DbgLog("SEND: got DONE while waiting for credit");
+                        ret = -1;
+                        break;
+                    } else if (cqResult.Status != ND_SUCCESS) {
+                        char buf[64];
+                        sprintf_s(buf, "SEND: credit wait CQ=0x%08X", cqResult.Status);
+                        SET_ERROR(buf);
+                        ret = -1; break;
+                    }
+                }
+                if (ret) break;
+            }
+            if (ret) break;
+
+            // 2. Pop free slot
+            uint32_t slot = freeSlots[freeHead];
+            freeHead = (freeHead + 1) & SLOT_MASK;
+            freeCount--;
+
+            // 3. Read chunk from disk
+            DWORD toRead = (fileSize - bytesSent > CHUNK_SIZE) ? CHUNK_SIZE
+                         : (DWORD)(fileSize - bytesSent);
             DWORD rb = 0;
-            if (!ReadFile(hFile, pChunk, toRead, &rb, nullptr) || rb != toRead) { ret = -1; aborted = true; break; }
-
-            sge.Buffer = pChunk; sge.BufferLength = toRead;
-            hr = ctx.pQp->Send(CHUNK_SEND_CTX, &sge, 1, 0);
-            if (FAILED(hr)) { SET_ERROR("Send chunk failed"); ret = -1; break; }
-            send_count++;
-            if ((send_count % 32) == 0) {
-                char buf[64]; sprintf_s(buf, "SEND: posted %lu sends, bytesSent=%llu", send_count, bytesSent);
-                DbgLog(buf);
+            if (!ReadFile(hFile, pChunk, toRead, &rb, nullptr) || rb != toRead) {
+                SET_ERROR("ReadFile failed"); ret = -1; break;
             }
 
-            bool sendDone = false;
-            while (!sendDone && !aborted) {
-                while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
-                if (IsCancelled()) { SET_ERROR("Cancelled by user"); ret = -1; break; }
-                if (result.Status != ND_SUCCESS) {
-                    char buf[64]; sprintf_s(buf, "SEND: chunk %lu CQ=0x%08X posted=%lu completed=%llu",
-                        send_count, result.Status, send_count, bytesSent);
-                    DbgLog(buf);
-                    sprintf_s(buf, "Chunk send CQ: 0x%08X", result.Status);
-                    SET_ERROR(buf); ret = -1; break;
+            // 4. RDMA Write chunk into receiver's ring buffer slot
+            UINT64 remoteAddr = remoteBaseAddr + (UINT64)slot * CHUNK_SIZE;
+            ND2_SGE writeSge = {}; writeSge.Buffer = pChunk;
+            writeSge.BufferLength = toRead; writeSge.MemoryRegionToken = localToken;
+            hr = ctx.pQp->Write(CHUNK_WRITE_CTX, &writeSge, 1,
+                remoteAddr, remoteToken, ND_OP_FLAG_SILENT_SUCCESS);
+            if (FAILED(hr)) { SET_ERROR("RDMA Write failed"); ret = -1; break; }
+            // Write is fire-and-forget (SILENT_SUCCESS). QP ordering guarantees
+            // the data arrives at the remote buffer before the doorbell below.
+
+            // 5. Send doorbell: tell receiver "slot X has Y bytes of data"
+            pDoorbell->slot_index = slot;
+            pDoorbell->data_size  = toRead;
+            ND2_SGE doorbellSge = {}; doorbellSge.Buffer = pDoorbell;
+            doorbellSge.BufferLength = sizeof(DoorbellMsg);
+            doorbellSge.MemoryRegionToken = localToken;
+            hr = ctx.pQp->Send(DOORBELL_SEND_CTX, &doorbellSge, 1, 0);
+            if (FAILED(hr)) { SET_ERROR("Send doorbell failed"); ret = -1; break; }
+
+            // 6. Wait for doorbell Send CQ
+            while (ctx.pCq->GetResults(&cqResult, 1) == 0 && !IsCancelled()) {}
+            if (IsCancelled()) { ret = -1; break; }
+            if (cqResult.Status != ND_SUCCESS) {
+                sprintf_s(logBuf, "SEND: doorbell CQ=0x%08X (Write may have failed)", cqResult.Status);
+                SET_ERROR(logBuf); ret = -1; break;
+            }
+
+            bytesSent += toRead;
+
+            // 7. Non-blocking check for any pending credits
+            while (true) {
+                ND2_RESULT cr;
+                ULONG got = ctx.pCq->GetResults(&cr, 1);
+                if (got == 0) break;
+                if (cr.Status == ND_SUCCESS &&
+                    (uintptr_t)cr.RequestContext >= 0x2000 &&
+                    (uintptr_t)cr.RequestContext < 0x2000 + usedSlots) {
+                    uint32_t bufIdx = (uint32_t)((uintptr_t)cr.RequestContext - 0x2000);
+                    uint32_t slotIdx = creditRecvs[bufIdx].slot_index;
+                    if (slotIdx == ABORT_SLOT_MARKER) {
+                        SET_ERROR("Receiver disk error (async)");
+                        ret = -1; break;
+                    }
+                    freeSlots[(freeHead + freeCount) & SLOT_MASK] = slotIdx;
+                    freeCount++;
+                    creditSge.Buffer = &creditRecvs[bufIdx];
+                    hr = ctx.pQp->Receive((void*)(uintptr_t)(0x2000 + bufIdx), &creditSge, 1);
+                    if (FAILED(hr)) { ret = -1; break; }
+                } else if (cr.Status == ND_SUCCESS && cr.RequestContext == DONE_RECV_CTX) {
+                    // Receiver sent DONE — all data already processed
+                    DbgLog("SEND: receiver sent DONE early — transfer complete");
+                    // We can exit the outer loop too, but let's check bytesSent first
+                    if (bytesSent >= fileSize) {
+                        // We already sent everything, receiver confirmed processing
+                        ret = 0;
+                    } else {
+                        ret = -1;
+                    }
+                    break;
                 }
-                if (result.RequestContext == CHUNK_SEND_CTX)      { sendDone = true; bytesSent += toRead; }
-                else if (result.RequestContext == TERM_RECV_CTX)  { if (pTerm->cmd == TERM_CMD_ABORT) { SET_ERROR("Receiver disk error"); aborted = true; ret = -1; } }
-                else { SET_ERROR("Unexpected CQ context"); ret = -1; break; }
             }
             if (ret) break;
 
             LARGE_INTEGER tn; QueryPerformanceCounter(&tn);
-            FireProgress(bytesSent, fileSize, (double)(tn.QuadPart - t0.QuadPart) / (double)freq.QuadPart);
-            // No pacing — RDMA should be CPU-offloaded. The receiver uses
-            // overlapped writes to keep its repost fast regardless of disk speed.
+            FireProgress(bytesSent, fileSize,
+                (double)(tn.QuadPart - t0.QuadPart) / (double)freq.QuadPart);
+        }
+
+        // ---- Drain: wait for all outstanding credits ---------------------------
+        // All chunks have been sent. Wait for the receiver to finish writing
+        // everything to disk and return all credits.
+        // If the receiver disconnects after finishing, CQ will return an error —
+        // that's OK as long as we already sent all data.
+        DbgLog("SEND: draining credits...");
+        while (freeCount < usedSlots && ret == 0 && !IsCancelled()) {
+            while (ctx.pCq->GetResults(&cqResult, 1) == 0 && !IsCancelled()) {}
+            if (IsCancelled()) { ret = -1; break; }
+            if (cqResult.Status == ND_SUCCESS &&
+                (uintptr_t)cqResult.RequestContext >= 0x2000 &&
+                (uintptr_t)cqResult.RequestContext < 0x2000 + usedSlots) {
+                uint32_t bufIdx = (uint32_t)((uintptr_t)cqResult.RequestContext - 0x2000);
+                uint32_t slotIdx = creditRecvs[bufIdx].slot_index;
+                if (slotIdx == ABORT_SLOT_MARKER) {
+                    SET_ERROR("Receiver disk error (drain)");
+                    ret = -1; break;
+                }
+                freeSlots[(freeHead + freeCount) & SLOT_MASK] = slotIdx;
+                freeCount++;
+                creditSge.Buffer = &creditRecvs[bufIdx];
+                hr = ctx.pQp->Receive((void*)(uintptr_t)(0x2000 + bufIdx), &creditSge, 1);
+                if (FAILED(hr)) { ret = -1; break; }
+            } else if (cqResult.Status == ND_SUCCESS &&
+                       cqResult.RequestContext == DONE_RECV_CTX) {
+                DbgLog("SEND: received DONE during drain");
+                freeCount = usedSlots;
+                break;
+            } else if (cqResult.Status != ND_SUCCESS) {
+                // Receiver may have disconnected after writing all data — OK.
+                DbgLog("SEND: drain CQ non-success — assuming receiver done");
+                freeCount = usedSlots;
+                break;
+            }
+        }
+
+        if (ret == 0) {
+            // ---- Send DONE to signal clean completion --------------------------
+            DbgLog("SEND: all credits returned, sending DONE");
+            uint32_t doneVal = 1;
+            ND2_SGE doneSendSge = {}; doneSendSge.Buffer = &doneVal;
+            doneSendSge.BufferLength = sizeof(doneVal);
+            doneSendSge.MemoryRegionToken = localToken;
+            hr = ctx.pQp->Send(DONE_SEND_CTX, &doneSendSge, 1, 0);
+            if (SUCCEEDED(hr)) {
+                while (ctx.pCq->GetResults(&cqResult, 1) == 0 && !IsCancelled()) {}
+                if (!IsCancelled() && cqResult.Status == ND_SUCCESS) {
+                    DbgLog("SEND: DONE sent successfully");
+                }
+            }
         }
 
         LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
-        FireProgress(bytesSent, fileSize, (double)(t1.QuadPart - t0.QuadPart) / (double)freq.QuadPart);
+        if (ret == 0) {
+            FireProgress(fileSize, fileSize,
+                (double)(t1.QuadPart - t0.QuadPart) / (double)freq.QuadPart);
+        }
     } while (0);
 
     if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
@@ -379,175 +603,283 @@ static std::wstring BuildOutputPath(const wchar_t* outPath, const char* filename
     return result;
 }
 
+// ===================================================================
+// RDMA Write file transfer — receiver
+// ===================================================================
 static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath) {
-    int ret = 0; NdContext ctx; HANDLE hFile = INVALID_HANDLE_VALUE; void* pBuf = nullptr;
+    int ret = 0; NdContext ctx; HANDLE hFile = INVALID_HANDLE_VALUE;
+    void* pBuf = nullptr;
     ResetCancel();
-    DbgLog("RECV: start");
-    char tmp[128];
-    const DWORD NUM_CHUNK_BUFS = QP_DEPTH - 1;
-    sprintf_s(tmp, "RECV: QP_DEPTH=%lu NUM_BUFS=%lu", (DWORD)QP_DEPTH, NUM_CHUNK_BUFS); DbgLog(tmp);
+    DbgLog("RECV: start (RDMA Write)");
 
     struct sockaddr_in localAddr = {};
     if (ParseIpv4(localIp, port, &localAddr) != 0) { SET_ERROR("ParseIpv4"); return -1; }
-    DbgLog("RECV: ParseIpv4 OK");
 
     HRESULT hr = NdOpenAdapter(IID_IND2Adapter, (const sockaddr*)&localAddr, sizeof(localAddr),
                                 (void**)&ctx.pAdapter);
     if (FAILED(hr)) { SET_ERROR("NdOpenAdapter"); return -1; }
-    DbgLog("RECV: NdOpenAdapter OK");
 
     ctx.ov.hEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
     if (!ctx.ov.hEvent) { SET_ERROR("CreateEvent"); return -1; }
-    DbgLog("RECV: CreateEvent OK");
     hr = ctx.pAdapter->CreateOverlappedFile(&ctx.hOvFile);
     if (FAILED(hr)) { SET_ERROR("CreateOverlappedFile"); CleanupNd(ctx); return -1; }
-    DbgLog("RECV: CreateOverlappedFile OK");
 
     hr = ctx.pAdapter->CreateCompletionQueue(IID_IND2CompletionQueue, ctx.hOvFile,
         CQ_DEPTH, 0, 0, (void**)&ctx.pCq);
     if (FAILED(hr)) { SET_ERROR("CreateCQ"); CleanupNd(ctx); return -1; }
-    DbgLog("RECV: CreateCQ OK");
 
     hr = ctx.pAdapter->CreateConnector(IID_IND2Connector, ctx.hOvFile, (void**)&ctx.pConnector);
     if (FAILED(hr)) { SET_ERROR("CreateConnector"); CleanupNd(ctx); return -1; }
-    DbgLog("RECV: CreateConnector OK");
 
     hr = ctx.pAdapter->CreateQueuePair(IID_IND2QueuePair, ctx.pCq, ctx.pCq, nullptr,
         QP_DEPTH, QP_DEPTH, 1, 1, 0, (void**)&ctx.pQp);
     if (FAILED(hr)) { SET_ERROR("CreateQP"); CleanupNd(ctx); return -1; }
-    DbgLog("RECV: CreateQP OK");
 
     hr = ctx.pAdapter->CreateMemoryRegion(IID_IND2MemoryRegion, ctx.hOvFile, (void**)&ctx.pMr);
     if (FAILED(hr)) { SET_ERROR("CreateMR"); CleanupNd(ctx); return -1; }
-    DbgLog("RECV: CreateMR OK");
 
-    const size_t bufSize = ALIGNMENT + (size_t)CHUNK_SIZE * NUM_CHUNK_BUFS + 8192;
-    pBuf = AllocAligned(bufSize);
-    if (!pBuf) { SET_ERROR("AllocAligned"); CleanupNd(ctx); return -1; }
-    DbgLog("RECV: AllocAligned OK");
+    // Allocate ONE big buffer: control area + ring buffer area.
+    // Single MR registration avoids multi-MR issues with remote tokens.
+    // Layout: [ctrl: FileMeta|SlotInfo|DoorbellBufs|DoneBuf] [ring: CHUNK_SIZE * NUM_SLOTS]
+    const size_t ctrlAreaSize = (sizeof(FileMeta) + sizeof(SlotInfo)
+                               + NUM_SLOTS * sizeof(DoorbellMsg)
+                               + sizeof(uint32_t) + sizeof(CreditMsg) + 4095) & ~4095;
+    const size_t ringAreaSize = (size_t)CHUNK_SIZE * NUM_SLOTS;
+    const size_t totalBufSize = ctrlAreaSize + ringAreaSize;
+    pBuf = AllocLarge(totalBufSize);
+    if (!pBuf) { SET_ERROR("AllocLarge total buf"); CleanupNd(ctx); return -1; }
+    DbgLog("RECV: total buf allocated (single MR)");
 
-    hr = ctx.pMr->Register(pBuf, bufSize, ND_MR_FLAG_ALLOW_LOCAL_WRITE, &ctx.ov);
+    hr = ctx.pMr->Register(pBuf, totalBufSize,
+        ND_MR_FLAG_ALLOW_LOCAL_WRITE | ND_MR_FLAG_ALLOW_REMOTE_WRITE, &ctx.ov);
     if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pMr, &ctx.ov);
-    if (FAILED(hr)) { SET_ERROR("Register"); CleanupNd(ctx); return -1; }
-    DbgLog("RECV: Register OK");
+    if (FAILED(hr)) { SET_ERROR("Register total buf"); CleanupNd(ctx); return -1; }
+    UINT32 ctrlToken = ctx.pMr->GetLocalToken();
+    UINT32 remoteToken = ctx.pMr->GetRemoteToken();
+    DbgLog("RECV: total buf registered (single MR)");
+
+    // Pointers in the unified buffer
+    char* buf = (char*)pBuf;
+    FileMeta*    pMeta      = (FileMeta*)buf;
+    SlotInfo*    pSlotInfo  = (SlotInfo*)(buf + sizeof(FileMeta));
+    DoorbellMsg* doorbellBufs = (DoorbellMsg*)(buf + sizeof(FileMeta) + sizeof(SlotInfo));
+    uint32_t*    pDoneRecv  = (uint32_t*)(buf + sizeof(FileMeta) + sizeof(SlotInfo)
+                               + NUM_SLOTS * sizeof(DoorbellMsg));
+    CreditMsg*   pCreditSend = (CreditMsg*)(buf + sizeof(FileMeta) + sizeof(SlotInfo)
+                               + NUM_SLOTS * sizeof(DoorbellMsg) + sizeof(uint32_t));
+    char*        pRingBuf   = buf + ctrlAreaSize;
 
     do {
-        UINT32 localToken = ctx.pMr->GetLocalToken();
-
         hr = ctx.pAdapter->CreateListener(IID_IND2Listener, ctx.hOvFile, (void**)&ctx.pListener);
         if (FAILED(hr)) { SET_ERROR("CreateListener"); ret = -1; break; }
-        DbgLog("RECV: CreateListener OK");
 
         hr = ctx.pListener->Bind((const sockaddr*)&localAddr, sizeof(localAddr));
-        if (FAILED(hr)) { SET_ERROR("Bind"); ret = -1; break; }
+        if (FAILED(hr)) { char b[64]; sprintf_s(b, "Bind failed: hr=0x%08X", hr); SET_ERROR(b); ret = -1; break; }
         hr = ctx.pListener->Listen(1);
         if (FAILED(hr)) { SET_ERROR("Listen"); ret = -1; break; }
-        DbgLog("RECV: Bind+Listen OK");
+        DbgLog("RECV: listening...");
 
+        // Post Recv for FileMeta BEFORE accepting the connection
+        ND2_SGE metaSge = {}; metaSge.Buffer = pMeta;
+        metaSge.BufferLength = sizeof(FileMeta); metaSge.MemoryRegionToken = ctrlToken;
+        hr = ctx.pQp->Receive(META_RECV_CTX, &metaSge, 1);
+        if (FAILED(hr)) { ret = -1; break; }
+
+        // Accept connection
         hr = ctx.pListener->GetConnectionRequest(ctx.pConnector, &ctx.ov);
         if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pListener, &ctx.ov);
         if (FAILED(hr)) { SET_ERROR("GetConnectionRequest"); ret = -1; break; }
-        DbgLog("RECV: GetConnectionRequest OK");
-
-        FileMeta* pMeta = (FileMeta*)pBuf;
-        char* chunkBufs[128];
-        for (DWORD i = 0; i < NUM_CHUNK_BUFS; i++)
-            chunkBufs[i] = (char*)pBuf + ALIGNMENT + i * CHUNK_SIZE;
-        TerminateCmd* pTerm = (TerminateCmd*)((char*)pBuf + ALIGNMENT + CHUNK_SIZE * NUM_CHUNK_BUFS);
-
-        ND2_SGE sge_meta = {}; sge_meta.Buffer = pMeta;
-        sge_meta.BufferLength = sizeof(FileMeta); sge_meta.MemoryRegionToken = localToken;
-
-        ND2_SGE sge_chunk = {}; sge_chunk.MemoryRegionToken = localToken;
-
-        hr = ctx.pQp->Receive(META_RECV_CTX, &sge_meta, 1);
-        if (FAILED(hr)) { ret = -1; break; }
-
-        for (DWORD i = 0; i < NUM_CHUNK_BUFS; i++) {
-            sge_chunk.Buffer = chunkBufs[i]; sge_chunk.BufferLength = CHUNK_SIZE;
-            hr = ctx.pQp->Receive(CHUNK_RECV_CTX, &sge_chunk, 1);
-            if (FAILED(hr)) { sprintf_s(tmp, "RECV: post recv[%lu] failed 0x%08X", i, hr); DbgLog(tmp); ret = -1; break; }
-        }
-        if (ret) break;
-        sprintf_s(tmp, "RECV: posted %lu chunk recvs", NUM_CHUNK_BUFS); DbgLog(tmp);
+        DbgLog("RECV: got connection request");
 
         hr = ctx.pConnector->Accept(ctx.pQp, 0, 0, nullptr, 0, &ctx.ov);
         if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
         if (FAILED(hr)) { ret = -1; break; }
+        DbgLog("RECV: accepted");
 
-        ND2_RESULT result = {}; bool metaDone = false;
-        while (!metaDone) {
-            while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
-            if (IsCancelled()) { ret = -1; break; }
-            if (result.Status != ND_SUCCESS) { ret = -1; break; }
-            if (result.RequestContext == META_RECV_CTX) metaDone = true;
-        }
-        if (ret || result.BytesTransferred != sizeof(FileMeta)) { if (!ret) ret = -1; break; }
+        // Wait for FileMeta
+        ND2_RESULT cqResult = {};
+        while (ctx.pCq->GetResults(&cqResult, 1) == 0 && !IsCancelled()) {}
+        if (IsCancelled() || cqResult.Status != ND_SUCCESS ||
+            cqResult.RequestContext != META_RECV_CTX) { ret = -1; break; }
+        uint64_t fileSize = pMeta->file_size;
+        DbgLog("RECV: got metadata");
 
-        FireMetadata(pMeta->filename, pMeta->file_size);
-
+        // Compute output path
         std::wstring finalPath = IsDirectory(outPath)
             ? BuildOutputPath(outPath, pMeta->filename)
             : std::wstring(outPath);
 
-        hFile = CreateFileW(finalPath.c_str(), GENERIC_WRITE, 0, nullptr,
-                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hFile == INVALID_HANDLE_VALUE) {
-            sge_chunk.Buffer = pTerm; sge_chunk.BufferLength = sizeof(TerminateCmd);
-            SendAbortSignal(ctx, sge_chunk, pTerm);
-            ret = -1; break;
+        // Check disk space (basic check)
+        ULARGE_INTEGER freeBytesAvailable;
+        if (GetDiskFreeSpaceExW(finalPath.c_str(), &freeBytesAvailable, nullptr, nullptr)) {
+            if (freeBytesAvailable.QuadPart < fileSize) {
+                SET_ERROR("Insufficient disk space");
+                ret = -1; break;
+            }
         }
 
-        const uint64_t fileSize = pMeta->file_size;
-        uint64_t bytesReceived = 0; DWORD ringIdx = 0; bool diskError = false;
-        LARGE_INTEGER freq, t0; QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&t0);
+        // Create output file
+        hFile = CreateFileW(finalPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) { ret = -1; break; }
+        DbgLog("RECV: created output file");
 
-        // Standard poll-repost-write loop. The receive queue stays full because
-        // NUM_CHUNK_BUFS (QP_DEPTH-1) exceeds the sender's speed advantage:
-        // at 1 GB/s and 300 MB/s receiver write, the 511-slot queue absorbs
-        // the full ~4.3 GB deficit before draining.
+        // ring buffer is inside the unified pBuf, already registered
+        UINT64 ringBase = (UINT64)pRingBuf;
+
+        // ---- Pre-post doorbell Recvs (all slots ready to receive notifications) -
+        ND2_SGE doorbellSge = {}; doorbellSge.MemoryRegionToken = ctrlToken;
+        for (uint32_t i = 0; i < NUM_SLOTS; i++) {
+            doorbellSge.Buffer = &doorbellBufs[i];
+            doorbellSge.BufferLength = sizeof(DoorbellMsg);
+            hr = ctx.pQp->Receive((void*)(uintptr_t)(0x1000 + i), &doorbellSge, 1);
+            if (FAILED(hr)) {
+                char buf[64]; sprintf_s(buf, "RECV: post doorbell[%lu] failed", i);
+                SET_ERROR(buf); ret = -1; break;
+            }
+        }
+        if (ret) break;
+        DbgLog("RECV: posted doorbell Recvs");
+
+        // ---- Pre-post DONE Recv (will be consumed after last doorbell) ----------
+        ND2_SGE doneSge = {}; doneSge.Buffer = pDoneRecv;
+        doneSge.BufferLength = sizeof(uint32_t); doneSge.MemoryRegionToken = ctrlToken;
+        hr = ctx.pQp->Receive(DONE_RECV_CTX, &doneSge, 1);
+        if (FAILED(hr)) { ret = -1; break; }
+
+        // ---- Send SlotInfo to sender (ring buffer details) --------------------
+        pSlotInfo->base_addr   = ringBase;
+        pSlotInfo->remote_token = remoteToken;
+        pSlotInfo->num_slots    = NUM_SLOTS;
+        ND2_SGE slotInfoSge = {}; slotInfoSge.Buffer = pSlotInfo;
+        slotInfoSge.BufferLength = sizeof(SlotInfo);
+        slotInfoSge.MemoryRegionToken = ctrlToken;
+        hr = ctx.pQp->Send(SLOTINFO_SEND_CTX, &slotInfoSge, 1, 0);
+        if (FAILED(hr)) { ret = -1; break; }
+        while (ctx.pCq->GetResults(&cqResult, 1) == 0 && !IsCancelled()) {}
+        if (IsCancelled() || cqResult.Status != ND_SUCCESS) { ret = -1; break; }
+        DbgLog("RECV: sent SlotInfo to sender");
+
+        // Fire metadata callback (filename + size)
+        FireMetadata(pMeta->filename, fileSize);
+
+        // ---- Transfer data loop -----------------------------------------------
+        // In this loop we process doorbells: the sender RDMA Writes data into our
+        // ring buffer silently (zero CPU), then sends a doorbell to wake us up.
+        // We read the doorbell, write the data to disk, and return a credit.
+        uint64_t bytesReceived = 0;
+        bool diskError = false;
+        LARGE_INTEGER freq, t0;
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&t0);
+        char logBuf[128];
+
         while (bytesReceived < fileSize && !diskError) {
+            // Wait for doorbell or DONE
+            while (ctx.pCq->GetResults(&cqResult, 1) == 0 && !IsCancelled()) {}
             if (IsCancelled()) { ret = -1; diskError = true; break; }
-            while (ctx.pCq->GetResults(&result, 1) == 0 && !IsCancelled()) {}
-            if (IsCancelled()) { ret = -1; diskError = true; break; }
-            if (result.Status != ND_SUCCESS || result.RequestContext != CHUNK_RECV_CTX) {
-                sprintf_s(tmp, "RECV: CQ error status=0x%08X bytesRecv=%llu",
-                    result.Status, bytesReceived); DbgLog(tmp);
+
+            if (cqResult.Status != ND_SUCCESS) {
+                if (bytesReceived >= fileSize) {
+                    break;
+                }
+                sprintf_s(logBuf, "RECV: CQ error ctx=0x%p status=0x%08X recvd=%llu",
+                    cqResult.RequestContext, cqResult.Status, bytesReceived);
+                SET_ERROR(logBuf);
                 ret = -1; diskError = true; break;
             }
-            DWORD received = result.BytesTransferred;
 
-            if (bytesReceived + received < fileSize) {
-                DWORD nextExpect = (fileSize - (bytesReceived + received) > CHUNK_SIZE)
-                    ? CHUNK_SIZE : (DWORD)(fileSize - (bytesReceived + received));
-                sge_chunk.Buffer = chunkBufs[ringIdx];
-                sge_chunk.BufferLength = nextExpect;
-                hr = ctx.pQp->Receive(CHUNK_RECV_CTX, &sge_chunk, 1);
-                if (FAILED(hr)) { ret = -1; diskError = true; break; }
+            if ((uintptr_t)cqResult.RequestContext >= 0x1000 &&
+                (uintptr_t)cqResult.RequestContext < 0x1000 + NUM_SLOTS) {
+                // Process doorbell
+                uint32_t dbIdx = (uint32_t)((uintptr_t)cqResult.RequestContext - 0x1000);
+                uint32_t slot = doorbellBufs[dbIdx].slot_index;
+                uint32_t dataSize = doorbellBufs[dbIdx].data_size;
+
+                if (slot >= NUM_SLOTS || dataSize > CHUNK_SIZE || dataSize == 0) {
+                    SET_ERROR("Invalid doorbell"); ret = -1; break;
+                }
+
+                // Write data from ring buffer slot to disk
+                DWORD wb = 0;
+                if (!WriteFile(hFile, (char*)pRingBuf + (size_t)slot * CHUNK_SIZE,
+                              dataSize, &wb, nullptr) || wb != dataSize) {
+                    SET_ERROR("WriteFile failed");
+                    diskError = true;
+                    pCreditSend->slot_index = ABORT_SLOT_MARKER;
+                    ND2_SGE abortSge = {};
+                    abortSge.Buffer = pCreditSend;
+                    abortSge.BufferLength = sizeof(CreditMsg);
+                    abortSge.MemoryRegionToken = ctrlToken;
+                    ctx.pQp->Send(CREDIT_SEND_CTX, &abortSge, 1, 0);
+                    ret = -1; break;
+                }
+                bytesReceived += dataSize;
+                if (bytesReceived % (10 * CHUNK_SIZE) == 0) {
+                    sprintf_s(logBuf, "RECV: %llu / %llu bytes (%.1f%%)",
+                        bytesReceived, fileSize,
+                        100.0 * (double)bytesReceived / (double)fileSize);
+                    DbgLog(logBuf);
+                }
+
+                // Send credit: fire-and-forget (no wait for CQ).
+                // The completion will arrive in the main poll loop below.
+                pCreditSend->slot_index = slot;
+                ND2_SGE creditSge = {};
+                creditSge.Buffer = pCreditSend;
+                creditSge.BufferLength = sizeof(CreditMsg);
+                creditSge.MemoryRegionToken = ctrlToken;
+                ctx.pQp->Send(CREDIT_SEND_CTX, &creditSge, 1, 0);
+
+                // Re-post this doorbell Recv immediately
+                doorbellSge.Buffer = &doorbellBufs[dbIdx];
+                doorbellSge.BufferLength = sizeof(DoorbellMsg);
+                hr = ctx.pQp->Receive((void*)(uintptr_t)(0x1000 + dbIdx), &doorbellSge, 1);
+                if (FAILED(hr)) { ret = -1; break; }
+
+                LARGE_INTEGER tn; QueryPerformanceCounter(&tn);
+                FireProgress(bytesReceived, fileSize,
+                    (double)(tn.QuadPart - t0.QuadPart) / (double)freq.QuadPart);
+
+            } else if (cqResult.RequestContext == CREDIT_SEND_CTX) {
+                // Credit Send completion — fire-and-forget, no action needed
+            } else if (cqResult.RequestContext == DONE_RECV_CTX) {
+                // Sender signaled transfer complete
+                DbgLog("RECV: received DONE from sender");
+                if (bytesReceived >= fileSize) {
+                    ret = 0;  // success
+                } else {
+                    SET_ERROR("Sender DONE but not all bytes received");
+                    ret = -1;
+                }
+                break;
+            } else {
+                sprintf_s(logBuf, "RECV: unexpected context 0x%p", cqResult.RequestContext);
+                SET_ERROR(logBuf);
+                ret = -1; break;
             }
-
-            DWORD wb = 0;
-            if (!WriteFile(hFile, chunkBufs[ringIdx], received, &wb, nullptr) || wb != received) {
-                ret = -1; diskError = true; break;
-            }
-            bytesReceived += received;
-            ringIdx = (ringIdx + 1) % NUM_CHUNK_BUFS;
-
-            LARGE_INTEGER tn; QueryPerformanceCounter(&tn);
-            FireProgress(bytesReceived, fileSize, (double)(tn.QuadPart - t0.QuadPart) / (double)freq.QuadPart);
         }
 
         if (diskError) {
-            sge_chunk.Buffer = pTerm; sge_chunk.BufferLength = sizeof(TerminateCmd);
-            SendAbortSignal(ctx, sge_chunk, pTerm);
+            // Send abort via credit mechanism
+            pCreditSend->slot_index = ABORT_SLOT_MARKER;
+            ND2_SGE abortSge = {};
+            abortSge.Buffer = pCreditSend;
+            abortSge.BufferLength = sizeof(CreditMsg);
+            abortSge.MemoryRegionToken = ctrlToken;
+            ctx.pQp->Send(CREDIT_SEND_CTX, &abortSge, 1, 0);
+            // fire-and-forget
         }
 
         LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
-        FireProgress(bytesReceived, fileSize, (double)(t1.QuadPart - t0.QuadPart) / (double)freq.QuadPart);
+        if (ret == 0) {
+            FireProgress(fileSize, fileSize,
+                (double)(t1.QuadPart - t0.QuadPart) / (double)freq.QuadPart);
+        }
     } while (0);
 
     if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
-    FreeAligned(pBuf);
+    FreeLarge(pBuf);  // unified buffer (control + ring, allocated via AllocLarge)
     ResetCancel();
     CleanupNd(ctx);
     return ret;
@@ -821,8 +1153,306 @@ RDMA_TRANSFER_API int rdma_list_adapters(rdma_adapter_info* out, int max_count)
     return count;
 }
 
+// Memory share context IDs (must not conflict with file transfer or benchmark IDs)
+#define MEM_SETUP_SEND_CTX    ((void*)0xA001)
+#define MEM_SETUP_RECV_CTX    ((void*)0xA002)
+#define MEM_WRITE_CTX         ((void*)0xA003)
+#define MEM_DOORBELL_SEND_CTX ((void*)0xA004)
+#define MEM_DOORBELL_RECV_CTX ((void*)0xA005)
+
+struct MemSetupInfo {
+    UINT64   remote_addr;
+    UINT32   remote_token;
+    uint32_t size;
+};
+
+struct MemDoorbellMsg {
+    uint32_t offset;
+    uint32_t length;
+};
+
+// Global state for memory share session
+static struct MemShareState {
+    NdContext ctx;
+    void*     pBuf         = nullptr;
+    char*     pLocalBuf    = nullptr;   // the actual shared memory
+    uint32_t  bufSize      = 0;
+    UINT32    localToken   = 0;
+    UINT32    remoteToken  = 0;
+    UINT64    remoteAddr   = 0;
+    int       mode         = -1;        // 0=display, 1=writer
+    bool      connected    = false;
+    MemDoorbellMsg lastDoorbell = {};
+    // Writer-side: pointer for doorbell send buffer (inside MR)
+    MemDoorbellMsg* pDoorbellSend = nullptr;
+} g_mem;
+
 // ===================================================================
-// Public API
+// Shared Memory Monitor — implementation
+// ===================================================================
+static void MemCleanup() {
+    if (g_mem.pBuf) { FreeLarge(g_mem.pBuf); g_mem.pBuf = nullptr; }
+    g_mem.pLocalBuf = nullptr;
+    g_mem.connected = false;
+    g_mem.mode = -1;
+    if (g_mem.ctx.pAdapter) {
+        if (g_mem.ctx.pQp || g_mem.ctx.pCq || g_mem.ctx.pMr || g_mem.ctx.pConnector) {
+            CleanupNd(g_mem.ctx);
+        }
+    }
+    memset(&g_mem.ctx, 0, sizeof(g_mem.ctx));
+}
+
+RDMA_TRANSFER_API int rdma_mem_start(int mode, const char* ip, unsigned short port, unsigned int size_bytes)
+{
+    if (g_mem.mode >= 0) { SET_ERROR("Memory share already active"); return -1; }
+    if (mode != 0 && mode != 1) { SET_ERROR("mode must be 0 (display) or 1 (writer)"); return -1; }
+    if (size_bytes < 1 || size_bytes > 64 * 1024 * 1024) { SET_ERROR("size must be 1..64MB"); return -1; }
+
+    MemCleanup();
+    g_mem.mode = mode;
+    g_mem.bufSize = size_bytes;
+    ResetCancel();
+
+    NdContext& ctx = g_mem.ctx;
+    struct sockaddr_in localAddr = {};
+    struct sockaddr_in remoteAddr = {};
+
+    HRESULT hr;
+    if (mode == 1) {
+        if (ParseIpv4(ip, port, &remoteAddr) != 0) { MemCleanup(); return -1; }
+        SIZE_T addrLen = sizeof(localAddr);
+        hr = NdResolveAddress((const sockaddr*)&remoteAddr, sizeof(remoteAddr),
+                               (sockaddr*)&localAddr, &addrLen);
+        if (FAILED(hr)) { MemCleanup(); return -1; }
+    } else {
+        if (ParseIpv4(ip, port, &localAddr) != 0) { MemCleanup(); return -1; }
+    }
+
+    hr = NdOpenAdapter(IID_IND2Adapter, (const sockaddr*)&localAddr, sizeof(localAddr),
+                       (void**)&ctx.pAdapter);
+    if (FAILED(hr)) { MemCleanup(); return -1; }
+
+    ctx.ov.hEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    if (!ctx.ov.hEvent) { MemCleanup(); return -1; }
+    hr = ctx.pAdapter->CreateOverlappedFile(&ctx.hOvFile);
+    if (FAILED(hr)) { MemCleanup(); return -1; }
+
+    hr = ctx.pAdapter->CreateCompletionQueue(IID_IND2CompletionQueue, ctx.hOvFile,
+        CQ_DEPTH, 0, 0, (void**)&ctx.pCq);
+    if (FAILED(hr)) { MemCleanup(); return -1; }
+
+    hr = ctx.pAdapter->CreateConnector(IID_IND2Connector, ctx.hOvFile, (void**)&ctx.pConnector);
+    if (FAILED(hr)) { MemCleanup(); return -1; }
+
+    hr = ctx.pAdapter->CreateQueuePair(IID_IND2QueuePair, ctx.pCq, ctx.pCq, nullptr,
+        QP_DEPTH, QP_DEPTH, 1, 1, 0, (void**)&ctx.pQp);
+    if (FAILED(hr)) { MemCleanup(); return -1; }
+
+    hr = ctx.pAdapter->CreateMemoryRegion(IID_IND2MemoryRegion, ctx.hOvFile, (void**)&ctx.pMr);
+    if (FAILED(hr)) { MemCleanup(); return -1; }
+
+    // Layout: [MemSetupInfo] [MemDoorbellRecv] [MemDoorbellSend] [staging: CHUNK_SIZE] [shared_data: size_bytes]
+    const size_t ctrlSize = sizeof(MemSetupInfo) + sizeof(MemDoorbellMsg) * 2;
+    const size_t stagingSize = CHUNK_SIZE;
+    const size_t totalSize = ctrlSize + stagingSize + size_bytes;
+    g_mem.pBuf = AllocLarge(totalSize);
+    if (!g_mem.pBuf) { MemCleanup(); return -1; }
+
+    hr = ctx.pMr->Register(g_mem.pBuf, totalSize,
+        ND_MR_FLAG_ALLOW_LOCAL_WRITE | ND_MR_FLAG_ALLOW_REMOTE_WRITE, &ctx.ov);
+    if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pMr, &ctx.ov);
+    if (FAILED(hr)) { MemCleanup(); return -1; }
+    g_mem.localToken = ctx.pMr->GetLocalToken();
+
+    // Setup pointers
+    char* base = (char*)g_mem.pBuf;
+    MemSetupInfo* pSetup = (MemSetupInfo*)base;
+    MemDoorbellMsg* pDoorbellRecv = (MemDoorbellMsg*)(base + sizeof(MemSetupInfo));
+    g_mem.pDoorbellSend = (MemDoorbellMsg*)(base + sizeof(MemSetupInfo) + sizeof(MemDoorbellMsg));
+    char* staging = base + ctrlSize;
+    g_mem.pLocalBuf = base + ctrlSize + stagingSize;
+    memset(g_mem.pLocalBuf, 0, size_bytes);
+
+    // Set up doorbell Recv buffer (in MR so Write won't access-violation)
+    // The Recv SGE points to pDoorbellRecv which is inside the MR
+
+    if (mode == 1) {
+        // ====== WRITER ======
+        hr = ctx.pConnector->Bind((const sockaddr*)&localAddr, sizeof(localAddr));
+        if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
+        if (FAILED(hr)) { MemCleanup(); return -1; }
+
+        ND2_SGE setupSge = {}; setupSge.Buffer = pSetup;
+        setupSge.BufferLength = sizeof(MemSetupInfo); setupSge.MemoryRegionToken = g_mem.localToken;
+        hr = ctx.pQp->Receive(MEM_SETUP_RECV_CTX, &setupSge, 1);
+        if (FAILED(hr)) { MemCleanup(); return -1; }
+
+        hr = ctx.pConnector->Connect(ctx.pQp, (const sockaddr*)&remoteAddr, sizeof(remoteAddr),
+                                      0, 0, nullptr, 0, &ctx.ov);
+        if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
+        if (FAILED(hr)) { MemCleanup(); return -1; }
+
+        hr = ctx.pConnector->CompleteConnect(&ctx.ov);
+        if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
+        if (FAILED(hr)) { MemCleanup(); return -1; }
+
+        ND2_RESULT cqResult = {};
+        while (ctx.pCq->GetResults(&cqResult, 1) == 0 && !IsCancelled()) {}
+        if (IsCancelled() || cqResult.Status != ND_SUCCESS) { MemCleanup(); return -1; }
+
+        g_mem.remoteAddr  = pSetup->remote_addr;
+        g_mem.remoteToken = pSetup->remote_token;
+        DbgLog("MEM: writer connected");
+    } else {
+        // ====== DISPLAY ======
+        hr = ctx.pAdapter->CreateListener(IID_IND2Listener, ctx.hOvFile, (void**)&ctx.pListener);
+        if (FAILED(hr)) { MemCleanup(); return -1; }
+
+        hr = ctx.pListener->Bind((const sockaddr*)&localAddr, sizeof(localAddr));
+        if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pListener, &ctx.ov);
+        if (FAILED(hr)) { MemCleanup(); return -1; }
+        hr = ctx.pListener->Listen(1);
+        if (FAILED(hr)) { MemCleanup(); return -1; }
+
+        ND2_SGE dbSge = {}; dbSge.Buffer = pDoorbellRecv;
+        dbSge.BufferLength = sizeof(MemDoorbellMsg); dbSge.MemoryRegionToken = g_mem.localToken;
+        hr = ctx.pQp->Receive(MEM_DOORBELL_RECV_CTX, &dbSge, 1);
+        if (FAILED(hr)) { MemCleanup(); return -1; }
+
+        hr = ctx.pListener->GetConnectionRequest(ctx.pConnector, &ctx.ov);
+        if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pListener, &ctx.ov);
+        if (FAILED(hr)) { MemCleanup(); return -1; }
+
+        hr = ctx.pConnector->Accept(ctx.pQp, 0, 0, nullptr, 0, &ctx.ov);
+        if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
+        if (FAILED(hr)) { MemCleanup(); return -1; }
+
+        pSetup->remote_addr  = (UINT64)g_mem.pLocalBuf;
+        pSetup->remote_token = ctx.pMr->GetRemoteToken();
+        pSetup->size         = size_bytes;
+        ND2_SGE setupSge = {}; setupSge.Buffer = pSetup;
+        setupSge.BufferLength = sizeof(MemSetupInfo); setupSge.MemoryRegionToken = g_mem.localToken;
+        hr = ctx.pQp->Send(MEM_SETUP_SEND_CTX, &setupSge, 1, 0);
+        if (FAILED(hr)) { MemCleanup(); return -1; }
+        ND2_RESULT cqResult = {};
+        while (ctx.pCq->GetResults(&cqResult, 1) == 0 && !IsCancelled()) {}
+        if (IsCancelled() || cqResult.Status != ND_SUCCESS) { MemCleanup(); return -1; }
+
+        DbgLog("MEM: display ready");
+    }
+
+    g_mem.connected = true;
+    return 0;
+}
+
+RDMA_TRANSFER_API int rdma_mem_write(unsigned int offset, const void* data, unsigned int len)
+{
+    if (!g_mem.connected || g_mem.mode != 1) { SET_ERROR("Not connected as writer"); return -1; }
+    if (offset + len > g_mem.bufSize) { SET_ERROR("Write exceeds buffer"); return -1; }
+    if (len > CHUNK_SIZE) { SET_ERROR("Write exceeds max size (4MB)"); return -1; }
+
+    NdContext& ctx = g_mem.ctx;
+
+    // Staging buffer is at g_mem.pBuf + ctrlSize. Copy user data there.
+    const size_t ctrlSize = sizeof(MemSetupInfo) + sizeof(MemDoorbellMsg) * 2;
+    char* staging = (char*)g_mem.pBuf + ctrlSize;
+    memcpy(staging, data, len);
+
+    // RDMA Write from staging buffer into display's shared buffer
+    UINT64 remoteAddr = g_mem.remoteAddr + offset;
+    ND2_SGE writeSge = {}; writeSge.Buffer = staging;
+    writeSge.BufferLength = len; writeSge.MemoryRegionToken = g_mem.localToken;
+    HRESULT hr = ctx.pQp->Write(MEM_WRITE_CTX, &writeSge, 1,
+        remoteAddr, g_mem.remoteToken, ND_OP_FLAG_SILENT_SUCCESS);
+    if (FAILED(hr)) { SET_ERROR("MEM Write failed"); return -1; }
+
+    // Send doorbell
+    g_mem.pDoorbellSend->offset = offset;
+    g_mem.pDoorbellSend->length = len;
+    ND2_SGE dbSge = {}; dbSge.Buffer = g_mem.pDoorbellSend;
+    dbSge.BufferLength = sizeof(MemDoorbellMsg); dbSge.MemoryRegionToken = g_mem.localToken;
+    hr = ctx.pQp->Send(MEM_DOORBELL_SEND_CTX, &dbSge, 1, 0);
+    if (FAILED(hr)) { SET_ERROR("MEM doorbell failed"); return -1; }
+
+    ND2_RESULT cqResult = {};
+    while (ctx.pCq->GetResults(&cqResult, 1) == 0 && !IsCancelled()) {}
+    if (IsCancelled() || cqResult.Status != ND_SUCCESS) { return -1; }
+    return 0;
+}
+
+RDMA_TRANSFER_API const void* rdma_mem_buffer(void)
+{
+    if (!g_mem.connected) return nullptr;
+    return g_mem.pLocalBuf;
+}
+
+RDMA_TRANSFER_API unsigned int rdma_mem_size(void)
+{
+    return g_mem.bufSize;
+}
+
+RDMA_TRANSFER_API int rdma_mem_wait(int timeout_ms)
+{
+    if (!g_mem.connected || g_mem.mode != 0) { SET_ERROR("Not connected as display"); return -1; }
+
+    NdContext& ctx = g_mem.ctx;
+    ND2_RESULT cqResult = {};
+
+    int elapsed = 0;
+    while (true) {
+        ULONG got = ctx.pCq->GetResults(&cqResult, 1);
+        if (got > 0) break;
+        if (IsCancelled()) return -1;
+        if (timeout_ms > 0) {
+            Sleep(1);
+            if (++elapsed >= timeout_ms) return 0;
+        } else if (timeout_ms == 0) {
+            Sleep(1); // infinite wait — yield
+        } else {
+            return 0; // non-blocking
+        }
+    }
+
+    if (cqResult.Status != ND_SUCCESS) {
+        DbgLog("MEM: doorbell error");
+        return -1;
+    }
+    if (cqResult.RequestContext != MEM_DOORBELL_RECV_CTX) {
+        DbgLog("MEM: unexpected CQ context");
+        return -1;
+    }
+
+    // Save doorbell info
+    MemDoorbellMsg* pDoorbellRecv = (MemDoorbellMsg*)((MemSetupInfo*)g_mem.pBuf + 1);
+    g_mem.lastDoorbell = *pDoorbellRecv;
+
+    // Re-post doorbell Recv for next update
+    ND2_SGE dbSge = {}; dbSge.Buffer = pDoorbellRecv;
+    dbSge.BufferLength = sizeof(MemDoorbellMsg); dbSge.MemoryRegionToken = g_mem.localToken;
+    ctx.pQp->Receive(MEM_DOORBELL_RECV_CTX, &dbSge, 1);
+
+    return 1;
+}
+
+RDMA_TRANSFER_API void rdma_mem_last_write(unsigned int* out_offset, unsigned int* out_len)
+{
+    if (out_offset) *out_offset = g_mem.lastDoorbell.offset;
+    if (out_len)    *out_len    = g_mem.lastDoorbell.length;
+}
+
+RDMA_TRANSFER_API void rdma_mem_stop(void)
+{
+    if (g_mem.mode < 0) return;
+    // Set cancel flag so any blocked rdma_mem_wait exits, then
+    // yield briefly to let the other thread finish before we destroy resources.
+    InterlockedExchange(&g_cancel_flag, 1);
+    Sleep(10);
+    ResetCancel();
+    MemCleanup();
+    DbgLog("MEM: stopped");
+}
+
 // ===================================================================
 RDMA_TRANSFER_API int rdma_transfer_init(void)
 {

@@ -15,202 +15,239 @@
 
     <Grid Padding="24">
         <Grid.RowDefinitions>
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
-        <!-- Title -->
-        <TextBlock Grid.Row="0"
-                  Text="RDMA 文件传输"
-                  Style="{StaticResource TitleTextBlockStyle}"
-                  Margin="0,0,0,16" />
+        <!-- Scrollable content area: all controls above buttons -->
+        <ScrollViewer Grid.Row="0">
+            <StackPanel>
+                <!-- Title -->
+                <TextBlock Text="RDMA 文件传输"
+                          Style="{StaticResource TitleTextBlockStyle}"
+                          Margin="0,0,0,16" />
 
-        <!-- Adapter selection -->
-        <Grid Grid.Row="1" Margin="0,0,0,16">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*" />
-                <ColumnDefinition Width="Auto" />
-            </Grid.ColumnDefinitions>
-            <ComboBox x:Name="AdapterComboBox"
-                       Grid.Column="0"
-                       Header="选择 RDMA 网卡"
-                       PlaceholderText="点击右侧按钮刷新网卡列表"
-                       HorizontalAlignment="Stretch"
-                       ToolTipService.ToolTip="{Binding SelectedItem.Description, ElementName=AdapterComboBox}" />
-            <Button x:Name="RefreshAdaptersButton"
-                     Grid.Column="1"
-                     Content="刷新"
-                     VerticalAlignment="Bottom"
-                     Margin="12,0,0,0"
-                     Click="RefreshAdaptersButton_Click" />
-        </Grid>
+                <!-- Adapter selection -->
+                <Grid Margin="0,0,0,16">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <ComboBox x:Name="AdapterComboBox"
+                               Grid.Column="0"
+                               Header="选择 RDMA 网卡"
+                               PlaceholderText="点击右侧按钮刷新网卡列表"
+                               HorizontalAlignment="Stretch"
+                               ToolTipService.ToolTip="{Binding SelectedItem.Description, ElementName=AdapterComboBox}" />
+                    <Button x:Name="RefreshAdaptersButton"
+                             Grid.Column="1"
+                             Content="刷新"
+                             VerticalAlignment="Bottom"
+                             Margin="12,0,0,0"
+                             Click="RefreshAdaptersButton_Click" />
+                </Grid>
 
-        <!-- Mode selection -->
-        <StackPanel Grid.Row="2" Margin="0,0,0,16">
-            <TextBlock Text="工作模式" Style="{StaticResource CaptionTextBlockStyle}" Margin="0,0,0,8" />
-            <RadioButtons x:Name="ModeRadioButtons"
-                          SelectionChanged="ModeRadioButtons_SelectionChanged">
-                <RadioButton x:Name="ModeSendRadioButton" Content="发送文件" Tag="Send" />
-                <RadioButton x:Name="ModeReceiveRadioButton" Content="接收文件" Tag="Receive" />
-                <RadioButton x:Name="ModeBenchmarkRadioButton" Content="性能测试" Tag="Benchmark" />
-                <RadioButton x:Name="ModeMemMonRadioButton" Content="内存监控" Tag="MemMon" />
-            </RadioButtons>
-        </StackPanel>
+                <!-- Mode selection -->
+                <StackPanel Margin="0,0,0,16">
+                    <TextBlock Text="工作模式" Style="{StaticResource CaptionTextBlockStyle}" Margin="0,0,0,8" />
+                    <RadioButtons x:Name="ModeRadioButtons"
+                                  SelectionChanged="ModeRadioButtons_SelectionChanged">
+                        <RadioButton x:Name="ModeSendRadioButton" Content="发送文件" Tag="Send" />
+                        <RadioButton x:Name="ModeReceiveRadioButton" Content="接收文件" Tag="Receive" />
+                        <RadioButton x:Name="ModeBenchmarkRadioButton" Content="性能测试" Tag="Benchmark" />
+                        <RadioButton x:Name="ModeMemMonRadioButton" Content="内存监控" Tag="MemMon" />
+                    </RadioButtons>
+                </StackPanel>
 
-        <!-- Connection info -->
-        <Grid Grid.Row="3" Margin="0,0,0,16">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*" />
-                <ColumnDefinition Width="Auto" />
-            </Grid.ColumnDefinitions>
-
-            <TextBox x:Name="IpTextBox"
-                      Grid.Column="0"
-                      Header="IP 地址"
-                      PlaceholderText="例如 192.168.100.2"
-                      HorizontalAlignment="Stretch" />
-
-            <StackPanel x:Name="ReceiverIpPanel" Grid.Column="0" Visibility="Collapsed">
-                <TextBlock Text="本地 IP 地址" Style="{StaticResource CaptionTextBlockStyle}" Margin="0,0,0,4" />
-                <TextBlock x:Name="ReceiverIpTextBlock"
-                           FontSize="16"
-                           TextWrapping="Wrap" />
-            </StackPanel>
-
-            <NumberBox x:Name="PortNumberBox"
-                       Grid.Column="1"
-                       Header="端口"
-                       Value="54321"
-                       Minimum="1"
-                       Maximum="65535"
-                       SpinButtonPlacementMode="Inline"
-                       Width="140"
-                       Margin="12,0,0,0" />
-        </Grid>
-
-        <!-- File / benchmark parameters -->
-        <StackPanel Grid.Row="4" Margin="0,0,0,16">
-            <!-- Send / Receive file path -->
-            <Grid x:Name="FilePathGrid">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="Auto" />
-                </Grid.ColumnDefinitions>
-
-                <TextBox x:Name="FilePathTextBox"
-                          Grid.Column="0"
-                          Header="文件路径"
-                          PlaceholderText="点击右侧按钮选择文件"
-                          IsReadOnly="True"
-                          HorizontalAlignment="Stretch" />
-
-                <Button x:Name="BrowseButton"
-                         Grid.Column="1"
-                         Content="浏览…"
-                         VerticalAlignment="Bottom"
-                         Margin="12,0,0,0"
-                         Click="BrowseButton_Click" />
-            </Grid>
-
-            <!-- Benchmark parameters -->
-            <StackPanel x:Name="BenchmarkGrid" Visibility="Collapsed">
-                <Grid Margin="0,0,0,8">
+                <!-- Connection info -->
+                <Grid Margin="0,0,0,16">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
 
-                    <NumberBox x:Name="BenchmarkSizeNumberBox"
-                               Grid.Column="0"
-                               Header="测试大小 (MiB)"
-                               Value="512"
+                    <TextBox x:Name="IpTextBox"
+                              Grid.Column="0"
+                              Header="IP 地址"
+                              PlaceholderText="例如 192.168.100.2"
+                              HorizontalAlignment="Stretch" />
+
+                    <StackPanel x:Name="ReceiverIpPanel" Grid.Column="0" Visibility="Collapsed">
+                        <TextBlock Text="本地 IP 地址" Style="{StaticResource CaptionTextBlockStyle}" Margin="0,0,0,4" />
+                        <TextBlock x:Name="ReceiverIpTextBlock"
+                                   FontSize="16"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+
+                    <NumberBox x:Name="PortNumberBox"
+                               Grid.Column="1"
+                               Header="端口"
+                               Value="54321"
                                Minimum="1"
-                               Maximum="1048576"
+                               Maximum="65535"
                                SpinButtonPlacementMode="Inline"
-                               HorizontalAlignment="Stretch" />
+                               Width="140"
+                               Margin="12,0,0,0" />
                 </Grid>
 
-                <TextBlock Text="测试端" Style="{StaticResource CaptionTextBlockStyle}" Margin="0,0,0,8" />
-                <RadioButtons x:Name="BenchmarkSideRadioButtons">
-                    <RadioButton x:Name="BenchmarkSideSenderRadioButton" Content="发送端" IsChecked="True" />
-                    <RadioButton x:Name="BenchmarkSideReceiverRadioButton" Content="接收端" />
-                </RadioButtons>
-            </StackPanel>
-
-            <!-- Memory Monitor parameters -->
-            <StackPanel x:Name="MemMonGrid" Visibility="Collapsed">
-                <Grid Margin="0,0,0,8">
+                <!-- File / benchmark / memory monitor parameters -->
+                <!-- Send / Receive file path -->
+                <Grid x:Name="FilePathGrid" Margin="0,0,0,16">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
-                    <NumberBox x:Name="MemMonSizeNumberBox"
-                               Grid.Column="0"
-                               Header="共享缓冲区大小"
-                               Value="65536"
-                               Minimum="1024"
-                               Maximum="4194304"
-                               SpinButtonPlacementMode="Inline"
-                               HorizontalAlignment="Stretch" />
-                </Grid>
-                <RadioButtons x:Name="MemMonSideRadioButtons"
-                              SelectionChanged="MemMonSideRadioButtons_SelectionChanged" Margin="0,0,0,8">
-                    <RadioButton x:Name="MemMonSideDisplayButton" Content="显示器（接收端）" IsChecked="True" />
-                    <RadioButton x:Name="MemMonSideWriterButton" Content="写入器（发送端）" />
-                </RadioButtons>
-                <!-- Writer input -->
-                <Grid x:Name="MemMonWriterGrid" Visibility="Collapsed">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="Auto" />
-                    </Grid.ColumnDefinitions>
-                    <TextBox x:Name="MemMonInputTextBox"
-                             Grid.Column="0"
-                             Header="写入数据"
-                             PlaceholderText="输入要写入共享内存的文本…"
-                             AcceptsReturn="True"
-                             MaxHeight="80"
-                             TextWrapping="Wrap"
-                             HorizontalAlignment="Stretch" />
-                    <Button x:Name="MemMonSendButton"
-                            Grid.Column="1"
-                            Content="写入"
-                            VerticalAlignment="Bottom"
-                            Margin="12,0,0,0"
-                            Click="MemMonSendButton_Click" />
-                </Grid>
-                <!-- Hex dump display -->
-                <Border BorderBrush="{ThemeResource SurfaceStrokeColorDefaultBrush}"
-                        BorderThickness="1"
-                        CornerRadius="4"
-                        Padding="8"
-                        Margin="0,8,0,0"
-                        MaxHeight="400">
-                    <ScrollViewer HorizontalScrollBarVisibility="Auto"
-                                  VerticalScrollBarVisibility="Auto">
-                        <TextBlock x:Name="MemMonHexText"
-                                   FontFamily="Consolas"
-                                   FontSize="12"
-                                   Text="等待连接…"
-                                   TextWrapping="NoWrap" />
-                    </ScrollViewer>
-                </Border>
-                <TextBlock x:Name="MemMonStatusText"
-                           Text=""
-                           FontSize="11"
-                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                           Margin="0,4,0,0" />
-            </StackPanel>
-        </StackPanel>
 
-        <!-- Action buttons -->
-        <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,0,0,16">
+                    <TextBox x:Name="FilePathTextBox"
+                              Grid.Column="0"
+                              Header="文件路径"
+                              PlaceholderText="点击右侧按钮选择文件"
+                              IsReadOnly="True"
+                              HorizontalAlignment="Stretch" />
+
+                    <Button x:Name="BrowseButton"
+                             Grid.Column="1"
+                             Content="浏览…"
+                             VerticalAlignment="Bottom"
+                             Margin="12,0,0,0"
+                             Click="BrowseButton_Click" />
+                </Grid>
+
+                <!-- Benchmark parameters -->
+                <StackPanel x:Name="BenchmarkGrid" Visibility="Collapsed" Margin="0,0,0,16">
+                    <Grid Margin="0,0,0,8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <NumberBox x:Name="BenchmarkSizeNumberBox"
+                                   Grid.Column="0"
+                                   Header="测试大小 (MiB)"
+                                   Value="512"
+                                   Minimum="1"
+                                   Maximum="1048576"
+                                   SpinButtonPlacementMode="Inline"
+                                   HorizontalAlignment="Stretch" />
+                    </Grid>
+                    <TextBlock Text="测试端" Style="{StaticResource CaptionTextBlockStyle}" Margin="0,0,0,8" />
+                    <RadioButtons x:Name="BenchmarkSideRadioButtons">
+                        <RadioButton x:Name="BenchmarkSideSenderRadioButton" Content="发送端" IsChecked="True" />
+                        <RadioButton x:Name="BenchmarkSideReceiverRadioButton" Content="接收端" />
+                    </RadioButtons>
+                </StackPanel>
+
+                <!-- Memory Monitor parameters -->
+                <StackPanel x:Name="MemMonGrid" Visibility="Collapsed" Margin="0,0,0,16">
+                    <Grid Margin="0,0,0,8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <NumberBox x:Name="MemMonSizeNumberBox"
+                                   Grid.Column="0"
+                                   Header="共享缓冲区大小"
+                                   Value="65536"
+                                   Minimum="1024"
+                                   Maximum="4194304"
+                                   SpinButtonPlacementMode="Inline"
+                                   HorizontalAlignment="Stretch" />
+                    </Grid>
+                    <RadioButtons x:Name="MemMonSideRadioButtons"
+                                  SelectionChanged="MemMonSideRadioButtons_SelectionChanged" Margin="0,0,0,8">
+                        <RadioButton x:Name="MemMonSideDisplayButton" Content="显示器（接收端）" IsChecked="True" />
+                        <RadioButton x:Name="MemMonSideWriterButton" Content="写入器（发送端）" />
+                    </RadioButtons>
+                    <!-- Writer input -->
+                    <Grid x:Name="MemMonWriterGrid" Visibility="Collapsed" Margin="0,0,8,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBox x:Name="MemMonInputTextBox"
+                                 Grid.Column="0"
+                                 Header="写入数据"
+                                 PlaceholderText="输入要写入共享内存的文本…"
+                                 AcceptsReturn="True"
+                                 MaxHeight="80"
+                                 TextWrapping="Wrap"
+                                 HorizontalAlignment="Stretch" />
+                        <Button x:Name="MemMonSendButton"
+                                Grid.Column="1"
+                                Content="写入"
+                                VerticalAlignment="Bottom"
+                                Margin="12,0,0,0"
+                                Click="MemMonSendButton_Click" />
+                    </Grid>
+                    <!-- Hex dump display -->
+                    <Border BorderBrush="{ThemeResource SurfaceStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="4"
+                            Padding="8"
+                            Margin="0,8,0,0">
+                        <ScrollViewer HorizontalScrollBarVisibility="Auto"
+                                      VerticalScrollBarVisibility="Auto"
+                                      MaxHeight="300">
+                            <TextBlock x:Name="MemMonHexText"
+                                       FontFamily="Consolas"
+                                       FontSize="12"
+                                       Text="等待连接…"
+                                       TextWrapping="NoWrap" />
+                        </ScrollViewer>
+                    </Border>
+                    <TextBlock x:Name="MemMonStatusText"
+                               Text=""
+                               FontSize="11"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               Margin="0,4,0,0" />
+                </StackPanel>
+
+                <!-- Progress and status -->
+                <StackPanel Margin="0,0,0,16">
+                    <TextBlock x:Name="FileNameTextBlock"
+                               Text=""
+                               TextWrapping="Wrap"
+                               FontWeight="SemiBold"
+                               Margin="0,0,0,4"
+                               Visibility="Collapsed" />
+                    <TextBlock x:Name="FileSizeTextBlock"
+                               Text=""
+                               TextWrapping="Wrap"
+                               Margin="0,0,0,4"
+                               Visibility="Collapsed" />
+                    <TextBlock x:Name="HashTextBlock"
+                               Text=""
+                               TextWrapping="Wrap"
+                               FontFamily="Consolas"
+                               FontSize="12"
+                               Margin="0,0,0,4"
+                               Visibility="Collapsed" />
+                    <TextBlock x:Name="RateTextBlock"
+                               Text=""
+                               TextWrapping="Wrap"
+                               Margin="0,0,0,8"
+                               Visibility="Collapsed" />
+                    <ProgressBar x:Name="TransferProgressBar"
+                                  Minimum="0"
+                                  Maximum="100"
+                                  Value="0"
+                                  Height="12"
+                                  Margin="0,0,0,8" />
+                    <TextBlock x:Name="StatusTextBlock"
+                               Text="就绪"
+                               TextWrapping="Wrap"
+                               Margin="0,0,0,8" />
+                    <TextBlock x:Name="ErrorTextBlock"
+                               Text=""
+                               Foreground="{ThemeResource SystemFillColorCriticalBrush}"
+                               TextWrapping="Wrap"
+                               Visibility="Collapsed" />
+                </StackPanel>
+            </StackPanel>
+        </ScrollViewer>
+
+        <!-- Action buttons — always visible at bottom -->
+        <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,0,0,16">
             <Button x:Name="CancelButton"
                      Content="取消"
                      Margin="0,0,12,0"
@@ -220,54 +257,6 @@
                      Content="开始"
                      Style="{StaticResource AccentButtonStyle}"
                      Click="StartButton_Click" />
-        </StackPanel>
-
-        <!-- Progress and status -->
-        <StackPanel Grid.Row="6" Margin="0,0,0,16">
-            <TextBlock x:Name="FileNameTextBlock"
-                       Text=""
-                       TextWrapping="Wrap"
-                       FontWeight="SemiBold"
-                       Margin="0,0,0,4"
-                       Visibility="Collapsed" />
-
-            <TextBlock x:Name="FileSizeTextBlock"
-                       Text=""
-                       TextWrapping="Wrap"
-                       Margin="0,0,0,4"
-                       Visibility="Collapsed" />
-
-            <TextBlock x:Name="HashTextBlock"
-                       Text=""
-                       TextWrapping="Wrap"
-                       FontFamily="Consolas"
-                       FontSize="12"
-                       Margin="0,0,0,4"
-                       Visibility="Collapsed" />
-
-            <TextBlock x:Name="RateTextBlock"
-                       Text=""
-                       TextWrapping="Wrap"
-                       Margin="0,0,0,8"
-                       Visibility="Collapsed" />
-
-            <ProgressBar x:Name="TransferProgressBar"
-                          Minimum="0"
-                          Maximum="100"
-                          Value="0"
-                          Height="12"
-                          Margin="0,0,0,8" />
-
-            <TextBlock x:Name="StatusTextBlock"
-                       Text="就绪"
-                       TextWrapping="Wrap"
-                       Margin="0,0,0,8" />
-
-            <TextBlock x:Name="ErrorTextBlock"
-                       Text=""
-                       Foreground="{ThemeResource SystemFillColorCriticalBrush}"
-                       TextWrapping="Wrap"
-                       Visibility="Collapsed" />
         </StackPanel>
     </Grid>
 </Window>
