@@ -338,6 +338,9 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
 
             LARGE_INTEGER tn; QueryPerformanceCounter(&tn);
             FireProgress(bytesSent, fileSize, (double)(tn.QuadPart - t0.QuadPart) / (double)freq.QuadPart);
+            // Yield CPU to the receiver process after each chunk so it can
+            // process CQ completions and repost receives.
+            Sleep(0);
         }
 
         LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
@@ -384,34 +387,34 @@ static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath
 
     HRESULT hr = NdOpenAdapter(IID_IND2Adapter, (const sockaddr*)&localAddr, sizeof(localAddr),
                                 (void**)&ctx.pAdapter);
-    if (FAILED(hr)) return -1;
+    if (FAILED(hr)) { SET_ERROR("NdOpenAdapter"); return -1; }
 
     ctx.ov.hEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-    if (!ctx.ov.hEvent) return -1;
+    if (!ctx.ov.hEvent) { SET_ERROR("CreateEvent"); return -1; }
     hr = ctx.pAdapter->CreateOverlappedFile(&ctx.hOvFile);
-    if (FAILED(hr)) { CleanupNd(ctx); return -1; }
+    if (FAILED(hr)) { SET_ERROR("CreateOverlappedFile"); CleanupNd(ctx); return -1; }
 
     hr = ctx.pAdapter->CreateCompletionQueue(IID_IND2CompletionQueue, ctx.hOvFile,
         CQ_DEPTH, 0, 0, (void**)&ctx.pCq);
-    if (FAILED(hr)) { CleanupNd(ctx); return -1; }
+    if (FAILED(hr)) { SET_ERROR("CreateCQ"); CleanupNd(ctx); return -1; }
 
     hr = ctx.pAdapter->CreateConnector(IID_IND2Connector, ctx.hOvFile, (void**)&ctx.pConnector);
-    if (FAILED(hr)) { CleanupNd(ctx); return -1; }
+    if (FAILED(hr)) { SET_ERROR("CreateConnector"); CleanupNd(ctx); return -1; }
 
     hr = ctx.pAdapter->CreateQueuePair(IID_IND2QueuePair, ctx.pCq, ctx.pCq, nullptr,
         QP_DEPTH, QP_DEPTH, 1, 1, 0, (void**)&ctx.pQp);
-    if (FAILED(hr)) { CleanupNd(ctx); return -1; }
+    if (FAILED(hr)) { SET_ERROR("CreateQP"); CleanupNd(ctx); return -1; }
 
     hr = ctx.pAdapter->CreateMemoryRegion(IID_IND2MemoryRegion, ctx.hOvFile, (void**)&ctx.pMr);
-    if (FAILED(hr)) { CleanupNd(ctx); return -1; }
+    if (FAILED(hr)) { SET_ERROR("CreateMR"); CleanupNd(ctx); return -1; }
 
     const size_t bufSize = ALIGNMENT + (size_t)CHUNK_SIZE * NUM_CHUNK_BUFS + 8192;
     pBuf = AllocAligned(bufSize);
-    if (!pBuf) { CleanupNd(ctx); return -1; }
+    if (!pBuf) { SET_ERROR("AllocAligned"); CleanupNd(ctx); return -1; }
 
     hr = ctx.pMr->Register(pBuf, bufSize, ND_MR_FLAG_ALLOW_LOCAL_WRITE, &ctx.ov);
     if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pMr, &ctx.ov);
-    if (FAILED(hr)) { CleanupNd(ctx); return -1; }
+    if (FAILED(hr)) { SET_ERROR("Register"); CleanupNd(ctx); return -1; }
 
     do {
         UINT32 localToken = ctx.pMr->GetLocalToken();
