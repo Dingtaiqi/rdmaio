@@ -111,5 +111,30 @@ namespace GUI
             int maxCount);
 
         #endregion
+
+        #region Shared Memory Monitor
+
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int rdma_mem_start(int mode, string ip, ushort port, uint sizeBytes);
+
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int rdma_mem_write(uint offset, IntPtr data, uint len);
+
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr rdma_mem_buffer();
+
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint rdma_mem_size();
+
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int rdma_mem_wait(int timeoutMs);
+
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void rdma_mem_last_write(out uint offset, out uint length);
+
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void rdma_mem_stop();
+
+        #endregion
     }
 }

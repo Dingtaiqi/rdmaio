@@ -99,6 +99,31 @@ namespace GUI
             UpdateUiForMode();
         }
 
+        private void MemMonSideRadioButtons_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            UpdateMemMonUi();
+        }
+
+        private async void MemMonSendButton_Click(object sender, RoutedEventArgs e)
+        {
+            string text = MemMonInputTextBox.Text;
+            if (string.IsNullOrWhiteSpace(text)) return;
+            MemMonSendButton.IsEnabled = false;
+            try
+            {
+                await RdmaMemoryShare.WriteStringAsync(0, text);
+                StatusTextBlock.Text = $"已写入 {text.Length} 字节到共享内存";
+            }
+            catch (Exception ex)
+            {
+                ShowError($"写入失败：{ex.Message}");
+            }
+            finally
+            {
+                MemMonSendButton.IsEnabled = true;
+            }
+        }
+
         private void UpdateUiForMode()
         {
             ClearFileInfo();
@@ -109,6 +134,7 @@ namespace GUI
             {
                 FilePathGrid.Visibility = Visibility.Visible;
                 BenchmarkGrid.Visibility = Visibility.Collapsed;
+                MemMonGrid.Visibility = Visibility.Collapsed;
                 IpTextBox.Visibility = Visibility.Visible;
                 ReceiverIpPanel.Visibility = Visibility.Collapsed;
                 FilePathTextBox.Header = "要发送的文件";
@@ -122,6 +148,7 @@ namespace GUI
             {
                 FilePathGrid.Visibility = Visibility.Visible;
                 BenchmarkGrid.Visibility = Visibility.Collapsed;
+                MemMonGrid.Visibility = Visibility.Collapsed;
                 IpTextBox.Visibility = Visibility.Collapsed;
                 ReceiverIpPanel.Visibility = Visibility.Visible;
                 FilePathTextBox.Header = "保存目录";
@@ -133,11 +160,45 @@ namespace GUI
             {
                 FilePathGrid.Visibility = Visibility.Collapsed;
                 BenchmarkGrid.Visibility = Visibility.Visible;
+                MemMonGrid.Visibility = Visibility.Collapsed;
                 IpTextBox.Header = "目标 IP 地址";
                 IpTextBox.PlaceholderText = "例如 192.168.100.2";
                 IpTextBox.IsReadOnly = false;
                 StartButton.Content = "开始测试";
                 UpdateBenchmarkIpDisplay();
+            }
+            else if (ModeMemMonRadioButton.IsChecked == true)
+            {
+                FilePathGrid.Visibility = Visibility.Collapsed;
+                BenchmarkGrid.Visibility = Visibility.Collapsed;
+                MemMonGrid.Visibility = Visibility.Visible;
+                IpTextBox.Visibility = Visibility.Visible;
+                ReceiverIpPanel.Visibility = Visibility.Collapsed;
+                IpTextBox.Header = "IP 地址";
+                IpTextBox.PlaceholderText = "例如 192.168.100.2";
+                IpTextBox.IsReadOnly = false;
+                StartButton.Content = "启动监控";
+                UpdateMemMonUi();
+            }
+        }
+
+        private void UpdateMemMonUi()
+        {
+            bool isWriter = MemMonSideWriterButton.IsChecked == true;
+            MemMonWriterGrid.Visibility = isWriter ? Visibility.Visible : Visibility.Collapsed;
+            if (isWriter)
+            {
+                IpTextBox.Visibility = Visibility.Visible;
+                ReceiverIpPanel.Visibility = Visibility.Collapsed;
+                IpTextBox.Header = "目标 IP 地址";
+                StartButton.Content = "连接并写入";
+            }
+            else
+            {
+                IpTextBox.Visibility = Visibility.Collapsed;
+                ReceiverIpPanel.Visibility = Visibility.Visible;
+                UpdateReceiverIpDisplay();
+                StartButton.Content = "启动监控";
             }
         }
 
@@ -420,6 +481,38 @@ namespace GUI
                     operationSucceeded = true;
                     StatusTextBlock.Text = "性能测试完成。";
                 }
+                else if (ModeMemMonRadioButton.IsChecked == true)
+                {
+                    if (!uint.TryParse(MemMonSizeNumberBox.Text, out uint memSize) || memSize < 1024)
+                    {
+                        ShowError("请输入有效的缓冲区大小（≥1024）。");
+                        return;
+                    }
+
+                    bool isWriter = MemMonSideWriterButton.IsChecked == true;
+                    ClearFileInfo();
+                    StatusTextBlock.Text = isWriter
+                        ? $"正在连接显示器 {ip}:{port}…"
+                        : $"正在 {ip}:{port} 上等待写入器…";
+
+                    await RdmaMemoryShare.StartAsync(isWriter, ip, port, memSize);
+                    operationSucceeded = true;
+                    Log("MEM: session started");
+
+                    if (isWriter)
+                    {
+                        // Writer mode — user writes via text box, we just wait
+                        StatusTextBlock.Text = $"已连接到 {ip}:{port}，在下方输入数据后点击「写入」";
+                        MemMonHexText.Text = $"已连接，缓冲区大小: {RdmaMemoryShare.BufferSize} 字节\n输入数据并点击「写入」以通过 RDMA Write 发送";
+                        Log("MEM: writer ready");
+                    }
+                    else
+                    {
+                        // Display mode — start update loop
+                        Log("MEM: display loop started");
+                        await RunDisplayUpdateLoopAsync(ct);
+                    }
+                }
             }
             catch (OperationCanceledException)
             {
@@ -441,6 +534,13 @@ namespace GUI
                 {
                     try { File.Delete(receiveOutputFilePath); Log($"CLEANUP deleted {receiveOutputFilePath}"); }
                     catch { /* best-effort */ }
+                }
+
+                // Memory Monitor cleanup
+                if (ModeMemMonRadioButton.IsChecked == true)
+                {
+                    RdmaMemoryShare.Stop();
+                    Log("MEM: cleaned up");
                 }
 
                 if (!operationSucceeded)
@@ -516,6 +616,116 @@ namespace GUI
                 unitIndex++;
             }
             return $"{size:F2} {units[unitIndex]}";
+        }
+
+        /// <summary>
+        /// Display-side update loop: waits for doorbells and refreshes the hex view.
+        /// </summary>
+        private async Task RunDisplayUpdateLoopAsync(CancellationToken ct)
+        {
+            try
+            {
+                int updateCount = 0;
+                while (!ct.IsCancellationRequested)
+                {
+                    bool updated = await RdmaMemoryShare.WaitForUpdateAsync(1000, ct);
+                    if (ct.IsCancellationRequested) break;
+                    if (updated)
+                    {
+                        var (off, len) = RdmaMemoryShare.GetLastWriteInfo();
+                        updateCount++;
+                        Log($"MEM: update #{updateCount} offset={off} length={len}");
+
+                        DispatcherQueue.TryEnqueue(() =>
+                        {
+                            MemMonHexText.Text = FormatHexDump(RdmaMemoryShare.BufferPtr,
+                                                               RdmaMemoryShare.BufferSize, 0, 256);
+                            MemMonStatusText.Text = $"更新 #{updateCount} | 偏移={off} | 长度={len} "
+                                + $"| 缓冲区={RdmaMemoryShare.BufferSize} 字节";
+                            TransferProgressBar.Value = 100;
+                        });
+                    }
+                    else
+                    {
+                        // Timeout — heartbeat to keep UI responsive
+                        if (updateCount > 0)
+                        {
+                            DispatcherQueue.TryEnqueue(() =>
+                            {
+                                MemMonHexText.Text = FormatHexDump(RdmaMemoryShare.BufferPtr,
+                                                                   RdmaMemoryShare.BufferSize, 0, 256);
+                            });
+                        }
+                    }
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                Log($"MEM: display loop error: {ex.Message}");
+                DispatcherQueue.TryEnqueue(() => ShowError($"监控循环错误：{ex.Message}"));
+            }
+            finally
+            {
+                Log("MEM: display loop ended");
+            }
+        }
+
+        /// <summary>
+        /// Format a hex dump from a native pointer, showing offset + hex bytes + ASCII.
+        /// </summary>
+        private static string FormatHexDump(IntPtr ptr, uint totalSize, uint startOffset, uint maxBytes)
+        {
+            if (ptr == IntPtr.Zero || totalSize == 0) return "(无数据)";
+
+            uint count = Math.Min(maxBytes, totalSize - startOffset);
+            if (count == 0) return "(偏移超出范围)";
+
+            byte[] buf = new byte[count];
+            Marshal.Copy(ptr + (int)startOffset, buf, 0, (int)count);
+
+            var sb = new System.Text.StringBuilder((int)(count / 16 * 80 + 100));
+            sb.AppendLine($"共享内存 | 共 {totalSize} 字节 | 显示前 {count} 字节");
+            sb.AppendLine(new string('-', 80));
+
+            int rows = (int)((count + 15) / 16);
+            for (int r = 0; r < rows; r++)
+            {
+                int offset = r * 16;
+                sb.Append($"{startOffset + (uint)offset:X8}  ");
+
+                // Hex bytes
+                for (int c = 0; c < 16; c++)
+                {
+                    int idx = offset + c;
+                    if (idx < count)
+                        sb.Append($"{buf[idx]:X2} ");
+                    else
+                        sb.Append("   ");
+                    if (c == 7) sb.Append(" ");
+                }
+
+                sb.Append(" |");
+
+                // ASCII
+                for (int c = 0; c < 16; c++)
+                {
+                    int idx = offset + c;
+                    if (idx < count)
+                    {
+                        byte b = buf[idx];
+                        sb.Append(b >= 32 && b < 127 ? (char)b : '.');
+                    }
+                    else
+                    {
+                        sb.Append(' ');
+                    }
+                }
+
+                sb.AppendLine("|");
+            }
+
+            return sb.ToString();
         }
 
         private void ShowError(string message)
