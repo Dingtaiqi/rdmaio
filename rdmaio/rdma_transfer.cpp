@@ -344,9 +344,11 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
 
             LARGE_INTEGER tn; QueryPerformanceCounter(&tn);
             FireProgress(bytesSent, fileSize, (double)(tn.QuadPart - t0.QuadPart) / (double)freq.QuadPart);
-            // Yield CPU to the receiver process after each chunk so it can
-            // process CQ completions and repost receives.
-            Sleep(0);
+            // Pace the sender so the receiver's receive-queue can keep up.
+            // Without this, the sender outruns the receiver's repost rate
+            // (~100-150 MB/s), and the 127-slot recv queue drains in ~2s
+            // causing ND_IO_TIMEOUT on transfers larger than ~500 MB.
+            Sleep(1);
         }
 
         LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
