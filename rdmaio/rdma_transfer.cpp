@@ -90,9 +90,15 @@ static void DbgLog(const char* msg) {
         if (p) { p[1] = 0; }
         strcat_s(logPath, "rdma_dll.log");
     }
+    OutputDebugStringA(buf);
     FILE* f = NULL;
     fopen_s(&f, logPath, "a");
     if (f) { fputs(buf, f); fflush(f); fclose(f); }
+    else {
+        // Fallback: write to stderr so it appears in the redirected console
+        fprintf(stderr, "%s", buf);
+        fflush(stderr);
+    }
 }
 
 // ---- Helpers ------------------------------------------------------------
@@ -383,53 +389,66 @@ static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath
     sprintf_s(tmp, "RECV: QP_DEPTH=%lu NUM_BUFS=%lu", (DWORD)QP_DEPTH, NUM_CHUNK_BUFS); DbgLog(tmp);
 
     struct sockaddr_in localAddr = {};
-    if (ParseIpv4(localIp, port, &localAddr) != 0) return -1;
+    if (ParseIpv4(localIp, port, &localAddr) != 0) { SET_ERROR("ParseIpv4"); return -1; }
+    DbgLog("RECV: ParseIpv4 OK");
 
     HRESULT hr = NdOpenAdapter(IID_IND2Adapter, (const sockaddr*)&localAddr, sizeof(localAddr),
                                 (void**)&ctx.pAdapter);
     if (FAILED(hr)) { SET_ERROR("NdOpenAdapter"); return -1; }
+    DbgLog("RECV: NdOpenAdapter OK");
 
     ctx.ov.hEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
     if (!ctx.ov.hEvent) { SET_ERROR("CreateEvent"); return -1; }
+    DbgLog("RECV: CreateEvent OK");
     hr = ctx.pAdapter->CreateOverlappedFile(&ctx.hOvFile);
     if (FAILED(hr)) { SET_ERROR("CreateOverlappedFile"); CleanupNd(ctx); return -1; }
+    DbgLog("RECV: CreateOverlappedFile OK");
 
     hr = ctx.pAdapter->CreateCompletionQueue(IID_IND2CompletionQueue, ctx.hOvFile,
         CQ_DEPTH, 0, 0, (void**)&ctx.pCq);
     if (FAILED(hr)) { SET_ERROR("CreateCQ"); CleanupNd(ctx); return -1; }
+    DbgLog("RECV: CreateCQ OK");
 
     hr = ctx.pAdapter->CreateConnector(IID_IND2Connector, ctx.hOvFile, (void**)&ctx.pConnector);
     if (FAILED(hr)) { SET_ERROR("CreateConnector"); CleanupNd(ctx); return -1; }
+    DbgLog("RECV: CreateConnector OK");
 
     hr = ctx.pAdapter->CreateQueuePair(IID_IND2QueuePair, ctx.pCq, ctx.pCq, nullptr,
         QP_DEPTH, QP_DEPTH, 1, 1, 0, (void**)&ctx.pQp);
     if (FAILED(hr)) { SET_ERROR("CreateQP"); CleanupNd(ctx); return -1; }
+    DbgLog("RECV: CreateQP OK");
 
     hr = ctx.pAdapter->CreateMemoryRegion(IID_IND2MemoryRegion, ctx.hOvFile, (void**)&ctx.pMr);
     if (FAILED(hr)) { SET_ERROR("CreateMR"); CleanupNd(ctx); return -1; }
+    DbgLog("RECV: CreateMR OK");
 
     const size_t bufSize = ALIGNMENT + (size_t)CHUNK_SIZE * NUM_CHUNK_BUFS + 8192;
     pBuf = AllocAligned(bufSize);
     if (!pBuf) { SET_ERROR("AllocAligned"); CleanupNd(ctx); return -1; }
+    DbgLog("RECV: AllocAligned OK");
 
     hr = ctx.pMr->Register(pBuf, bufSize, ND_MR_FLAG_ALLOW_LOCAL_WRITE, &ctx.ov);
     if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pMr, &ctx.ov);
     if (FAILED(hr)) { SET_ERROR("Register"); CleanupNd(ctx); return -1; }
+    DbgLog("RECV: Register OK");
 
     do {
         UINT32 localToken = ctx.pMr->GetLocalToken();
 
         hr = ctx.pAdapter->CreateListener(IID_IND2Listener, ctx.hOvFile, (void**)&ctx.pListener);
-        if (FAILED(hr)) { ret = -1; break; }
+        if (FAILED(hr)) { SET_ERROR("CreateListener"); ret = -1; break; }
+        DbgLog("RECV: CreateListener OK");
 
         hr = ctx.pListener->Bind((const sockaddr*)&localAddr, sizeof(localAddr));
-        if (FAILED(hr)) { ret = -1; break; }
+        if (FAILED(hr)) { SET_ERROR("Bind"); ret = -1; break; }
         hr = ctx.pListener->Listen(1);
-        if (FAILED(hr)) { ret = -1; break; }
+        if (FAILED(hr)) { SET_ERROR("Listen"); ret = -1; break; }
+        DbgLog("RECV: Bind+Listen OK");
 
         hr = ctx.pListener->GetConnectionRequest(ctx.pConnector, &ctx.ov);
         if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pListener, &ctx.ov);
-        if (FAILED(hr)) { ret = -1; break; }
+        if (FAILED(hr)) { SET_ERROR("GetConnectionRequest"); ret = -1; break; }
+        DbgLog("RECV: GetConnectionRequest OK");
 
         FileMeta* pMeta = (FileMeta*)pBuf;
         char* chunkBufs[128];
