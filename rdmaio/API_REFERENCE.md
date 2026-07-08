@@ -1,6 +1,8 @@
 # rdma_transfer.dll — API Reference
 
-基于 Windows NetworkDirect (NDSPI) 的 RDMA 文件传输库，纯 C 接口，任何 C/C++ 项目均可调用。
+基于 Windows NetworkDirect (NDSPI) 的 RDMA 库，纯 C 接口，任何 C/C++ 项目均可调用。
+
+**架构**：RDMA Write + Credit 流控（文件传输）/ Doorbell 通知（共享内存监控）。
 
 **依赖**：Mellanox/Intel/Chelsio ND 驱动。
 
@@ -12,6 +14,7 @@
 |---|---|
 | [生命周期](#生命周期) | `rdma_transfer_init`, `rdma_transfer_cleanup` |
 | [文件传输](#文件传输) | `rdma_send_file`, `rdma_recv_file` |
+| [共享内存监控](#共享内存监控) | `rdma_mem_start`, `rdma_mem_write`, `rdma_mem_buffer`, `rdma_mem_size`, `rdma_mem_wait`, `rdma_mem_last_write`, `rdma_mem_stop` |
 | [性能测试](#性能测试) | `rdma_bench` |
 | [回调](#回调) | `rdma_set_progress_callback`, `rdma_set_metadata_callback` |
 | [控制](#控制) | `rdma_transfer_cancel` |
@@ -27,7 +30,7 @@
 int rdma_transfer_init(void);
 ```
 
-初始化 RDMA 栈。首次调用执行 `WSAStartup` → `NdStartup`。
+初始化 RDMA 栈和 Winsock。首次调用执行 `WSAStartup` → `NdStartup`。
 
 | 属性 | 值 |
 |---|---|
@@ -40,11 +43,13 @@ int rdma_transfer_init(void);
 void rdma_transfer_cleanup(void);
 ```
 
-清理 RDMA 栈。与 `init` 配对，引用计数归零时执行 `NdCleanup` → `WSACleanup`。
+清理 RDMA 栈。引用计数归零时执行 `NdCleanup` → `WSACleanup`。
 
 ---
 
 ## 文件传输
+
+基于 **RDMA Write + Credit 流控**。发送端 RDMA Write 数据到接收端 ring buffer（零 CPU），通过 doorbell/credit 做流控。
 
 ### `rdma_send_file`
 
@@ -56,15 +61,14 @@ int rdma_send_file(
 );
 ```
 
-通过 RDMA Send/Recv 发送文件。**阻塞**，传输完成或出错才返回。
-
-**协议**: 268 字节元数据 (文件名+大小) → 4 MB 分块数据 → 终止信号。
+发送文件。**阻塞**，传输完成或出错才返回。
 
 | 属性 | 值 |
 |---|---|
 | 返回值 | `0` 成功, `-1` 失败 |
 | 可取消 | `rdma_transfer_cancel()` |
 | 进度 | `rdma_set_progress_callback` |
+| 块大小 | 4 MB |
 
 ### `rdma_recv_file`
 
@@ -84,7 +88,105 @@ int rdma_recv_file(
 | 可取消 | `rdma_transfer_cancel()` |
 | 进度 | `rdma_set_progress_callback` |
 | 元数据 | `rdma_set_metadata_callback` |
-| 磁盘失败 | 向发送端发终止信号 (cmd=0xDEADBEEF) |
+
+---
+
+## 共享内存监控
+
+一端（写入器）通过 **RDMA Write** 直接写入另一端（显示器）的共享缓冲区，显示器实时看到数据变化——接收端 CPU 在数据路径上完全为零介入。
+
+详细设计见 [RDMA_MEMORY_MONITOR.md](RDMA_MEMORY_MONITOR.md)。
+
+### `rdma_mem_start`
+
+```c
+int rdma_mem_start(int mode, const char* ip, unsigned short port, unsigned int size_bytes);
+```
+
+启动共享内存会话。
+
+| 参数 | 说明 |
+|---|---|
+| `mode` | `0` = 显示器（接收端，拥有缓冲区）, `1` = 写入器（发送端，写数据） |
+| `ip` | 显示器端 IP（mode=0 时监听此 IP，mode=1 时连接到此 IP） |
+| `port` | 端口号 |
+| `size_bytes` | 共享缓冲区大小（1 ~ 64 MB） |
+
+| 返回值 | 含义 |
+|---|---|
+| `0` | 成功 |
+| `-1` | 失败（可用 `rdma_transfer_last_error()` 获取错误信息） |
+
+### `rdma_mem_write`
+
+```c
+int rdma_mem_write(unsigned int offset, const void* data, unsigned int len);
+```
+
+**仅写入器端**。将数据写入远程共享缓冲区。内部先复制到 staging buffer，然后 RDMA Write + doorbell。
+
+| 参数 | 说明 |
+|---|---|
+| `offset` | 写入偏移量（从共享缓冲区起始） |
+| `data` | 源数据指针 |
+| `len` | 数据长度（最大 4 MB） |
+
+| 返回值 | 含义 |
+|---|---|
+| `0` | 成功 |
+| `-1` | 失败 |
+
+### `rdma_mem_buffer`
+
+```c
+const void* rdma_mem_buffer(void);
+```
+
+**仅显示器端**。获取共享缓冲区指针。通过此指针直接读取写入器写入的数据。返回 `NULL` 表示未连接。
+
+### `rdma_mem_size`
+
+```c
+unsigned int rdma_mem_size(void);
+```
+
+获取共享缓冲区大小（字节）。返回 `0` 表示未连接。
+
+### `rdma_mem_wait`
+
+```c
+int rdma_mem_wait(int timeout_ms);
+```
+
+**仅显示器端**。阻塞直到下一个 doorbell（数据更新）到达。
+
+| `timeout_ms` | 行为 |
+|---|---|
+| `> 0` | 最多等待 `timeout_ms` 毫秒 |
+| `0` | 无限等待 |
+| `< 0` | 非阻塞，立即返回 |
+
+| 返回值 | 含义 |
+|---|---|
+| `1` | 有新数据（调用 `rdma_mem_buffer` / `rdma_mem_last_write` 读取）|
+| `0` | 超时 |
+| `-1` | 错误或已取消 |
+
+### `rdma_mem_last_write`
+
+```c
+void rdma_mem_last_write(unsigned int* out_offset, unsigned int* out_len);
+```
+
+获取最近一次写入的偏移和长度。可在 `rdma_mem_wait()` 返回 `1` 后调用。
+
+### `rdma_mem_stop`
+
+```c
+void rdma_mem_stop(void);
+```
+
+停止共享内存会话并释放所有资源。幂等，可多次调用。
 
 ---
 
@@ -104,7 +206,7 @@ int rdma_bench(
 纯内存 RDMA Write 带宽测试，**不涉及磁盘 I/O**。发送端输出：
 
 ```
-RDMA Write: 512 MB in 213.4 ms  |  2399.7 MB/s  (19.20 Gbps)
+RDMA Write: 1024 MB in 429.8 ms  |  2382.7 MB/s  (19.06 Gbps)
 ```
 
 | 属性 | 值 |
@@ -133,7 +235,7 @@ void rdma_set_progress_callback(
 );
 ```
 
-每个数据块完成时调用（约每 4 MB 一次）。传 `NULL` 取消。
+每个数据块完成时调用（文件传输约每 4 MB 一次；共享内存监控无进度回调）。传 `NULL` 取消。
 
 > 回调在传输线程内**同步**调用，不要做耗时操作。
 
@@ -152,7 +254,7 @@ void rdma_set_metadata_callback(
 );
 ```
 
-**仅接收端**。收到发送端元数据时调用，可在回调中确定保存文件名。传 `NULL` 取消。
+**仅文件传输接收端**。收到发送端元数据时调用，可在回调中确定保存文件名。传 `NULL` 取消。
 
 ---
 
@@ -164,11 +266,19 @@ void rdma_set_metadata_callback(
 void rdma_transfer_cancel(void);
 ```
 
-从**另一个线程**调用，中断正在进行的 `rdma_send_file` / `rdma_recv_file` / `rdma_bench`。
+从**另一个线程**调用，中断正在进行的 `rdma_send_file` / `rdma_recv_file` / `rdma_bench` / `rdma_mem_wait`。
 
 - 被中断的阻塞调用返回 `-1`
 - 空闲时调用无副作用
 - 微秒级响应（CQ 轮询立即退出）
+
+### `rdma_transfer_last_error`
+
+```c
+const char* rdma_transfer_last_error(void);
+```
+
+最后一次错误的描述信息。返回的指针指向静态缓冲区，下次 `rdma_*` 调用可能被覆盖。
 
 ---
 
@@ -210,11 +320,45 @@ int rdma_list_adapters(
 
 ## 示例
 
-### 带进度的文件发送
+### 共享内存监控
 
 ```c
 #include "rdma_transfer.h"
-#pragma comment(lib, "rdma_transfer.lib")
+
+// 显示器端
+rdma_transfer_init();
+rdma_mem_start(0, "192.168.100.2", 54323, 65536);  // 65536 字节缓冲区
+
+while (true) {
+    int ret = rdma_mem_wait(1000);  // 等 doorbell, 1 秒超时
+    if (ret == 1) {
+        unsigned char* buf = (unsigned char*)rdma_mem_buffer();
+        unsigned int size = rdma_mem_size();
+        unsigned int off, len;
+        rdma_mem_last_write(&off, &len);
+        printf("写入 @%u +%u: 首字节 = 0x%02X\n", off, len, buf[0]);
+    }
+}
+rdma_mem_stop();
+rdma_transfer_cleanup();
+```
+
+```c
+// 写入器端
+rdma_transfer_init();
+rdma_mem_start(1, "192.168.100.2", 54323, 65536);
+
+const char* msg = "Hello RDMA Write!";
+rdma_mem_write(0, msg, strlen(msg) + 1);
+
+rdma_mem_stop();
+rdma_transfer_cleanup();
+```
+
+### 文件传输
+
+```c
+#include "rdma_transfer.h"
 
 void on_progress(double pct, double speed, void* ctx) {
     printf("\r%.1f%%  %.1f MB/s", pct, speed);
@@ -254,9 +398,7 @@ rdma_transfer_cleanup();
 
 ```c
 // 传输线程
-rdma_transfer_init();
-rdma_send_file("192.168.100.2", 54321, L"D:\\big.bin"); // 阻塞
-rdma_transfer_cleanup();
+rdma_send_file("192.168.100.2", 54321, L"D:\\big.bin");  // 阻塞
 
 // 用户点了取消按钮 → 另一个线程调用
 rdma_transfer_cancel();  // 传输线程立即返回 -1
@@ -269,7 +411,7 @@ rdma_transfer_cancel();  // 传输线程立即返回 -1
 | 返回值 | 含义 |
 |---|---|
 | `0` | 成功 |
-| `-1` | 失败 (传输错误 / 被取消) |
+| `-1` | 失败（传输错误 / 被取消） |
 | `> 0` | 仅 `rdma_list_adapters`: 适配器数量 |
 
 ---
