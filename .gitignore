@@ -1,8 +1,12 @@
 # Build outputs
 x64/
+**/bin/
+**/obj/
 *.exe
 *.pdb
 *.lib
+*.dll
+*.exp
 *.obj
 *.iobj
 *.ipdb
@@ -21,22 +25,21 @@ DocumentLayout.json
 Browse.VC.db
 AutoPCH/
 
+# .NET
+*.nupkg
+project.assets.json
+*.runtimeconfig.json
+
 # Logs & test artifacts
 *.log
 *.bin
 *.txt
 
 # Temp scripts
-recv*.bat
-send*.bat
-bench*.bat
-test_transfer*.bat
-test_ndpingpong.bat
-recv_noredir.bat
-recv_direct_test.bat
-adapter_info.bat
-check_nic*.ps1
-bench_send_test.bat
+test_*.bat
+test_*.ps1
+build_bench.bat
+build_mem_demo.bat
 
 # SSH
 *_pubkey*
@@ -48,14 +51,17 @@ __pycache__/
 # Claude
 .claude/
 
-# Local helper scripts (superseded by build_all.bat)
-build_rdmaio.bat
-build_netdirect.bat
-
 # External dependency
 NetworkDirect/
 
 # DLL outputs
-*.exp
-*.ilk excluded from build
 rdmaio/rdmaio/rdmaio.cpp
+
+# Build artifacts
+*.pgd
+*.pgc
+*.sbr
+
+# Superseded single-step build scripts
+build_rdmaio.bat
+build_netdirect.bat
