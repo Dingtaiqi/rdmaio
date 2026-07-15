@@ -308,7 +308,8 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
     pBuf = AllocAligned(sendBufSize);
     if (!pBuf) { CleanupNd(ctx); return -1; }
 
-    hr = ctx.pMr->Register(pBuf, sendBufSize, ND_MR_FLAG_ALLOW_LOCAL_WRITE, &ctx.ov);
+    hr = ctx.pMr->Register(pBuf, sendBufSize,
+        ND_MR_FLAG_ALLOW_LOCAL_WRITE | (g_is_read ? ND_MR_FLAG_ALLOW_REMOTE_READ : 0), &ctx.ov);
     if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pMr, &ctx.ov);
     if (FAILED(hr)) { SET_ERROR("Register send buffer failed"); CleanupNd(ctx); return -1; }
     UINT32 localToken = ctx.pMr->GetLocalToken();
@@ -328,7 +329,7 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
         if (FAILED(hr)) { SET_ERROR("Bind failed"); ret = -1; break; }
 
         hr = ctx.pConnector->Connect(ctx.pQp, (const sockaddr*)&remoteAddr, sizeof(remoteAddr),
-                                      0, 0, nullptr, 0, &ctx.ov);
+                                      0, g_is_read ? 16 : 0, nullptr, 0, &ctx.ov);
         if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
         if (FAILED(hr)) { char b[64]; sprintf_s(b, "Connect failed: hr=0x%08X", hr); SET_ERROR(b); ret = -1; break; }
 
@@ -371,18 +372,36 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
         if (!WaitForCompletion(ctx.pCq, &ctx.ov, cqResult)) { ret = -1; break; }
         if (cqResult.Status != ND_SUCCESS) { ret = -1; break; }
 
-        // 2. Wait for SlotInfo from receiver (remote buffer layout)
-        if (!WaitForCompletion(ctx.pCq, &ctx.ov, cqResult)) { ret = -1; break; }
-        if (IsCancelled() || cqResult.Status != ND_SUCCESS ||
-            cqResult.RequestContext != SLOTINFO_RECV_CTX) { ret = -1; break; }
-        UINT64 remoteBaseAddr = pSlotInfo->base_addr;
-        UINT32 remoteToken    = pSlotInfo->remote_token;
-        uint32_t remoteSlots  = pSlotInfo->num_slots;
-        if (remoteSlots < 1) { SET_ERROR("Receiver has no slots"); ret = -1; break; }
-        uint32_t usedSlots = min(remoteSlots, NUM_SLOTS);
-        sprintf_s(logBuf, "SEND: got slot info: base=0x%llX token=0x%X slots=%lu",
-            remoteBaseAddr, remoteToken, usedSlots);
-        DbgLog(logBuf);
+        UINT64 remoteBaseAddr = 0;
+        UINT32 remoteToken = 0;
+        uint32_t usedSlots = NUM_SLOTS;
+
+        if (g_is_read) {
+            // Read mode: send our ring buffer info to receiver (receiver reads from us)
+            pSlotInfo->base_addr    = (UINT64)pChunk;
+            pSlotInfo->remote_token = localToken;
+            pSlotInfo->num_slots    = usedSlots;
+            ND2_SGE siSge = {}; siSge.Buffer = pSlotInfo;
+            siSge.BufferLength = sizeof(SlotInfo); siSge.MemoryRegionToken = localToken;
+            hr = ctx.pQp->Send(SLOTINFO_SEND_CTX, &siSge, 1, 0);
+            if (FAILED(hr)) { SET_ERROR("Send SlotInfo failed"); ret = -1; break; }
+            if (!WaitForCompletion(ctx.pCq, &ctx.ov, cqResult)) { ret = -1; break; }
+            if (cqResult.Status != ND_SUCCESS) { ret = -1; break; }
+            DbgLog("SEND: sent ring buffer info (Read mode)");
+        } else {
+            // Write mode: receive ring buffer info from receiver
+            if (!WaitForCompletion(ctx.pCq, &ctx.ov, cqResult)) { ret = -1; break; }
+            if (IsCancelled() || cqResult.Status != ND_SUCCESS ||
+                cqResult.RequestContext != SLOTINFO_RECV_CTX) { ret = -1; break; }
+            remoteBaseAddr = pSlotInfo->base_addr;
+            remoteToken    = pSlotInfo->remote_token;
+            uint32_t remoteSlots = pSlotInfo->num_slots;
+            if (remoteSlots < 1) { SET_ERROR("Receiver has no slots"); ret = -1; break; }
+            usedSlots = min(remoteSlots, NUM_SLOTS);
+            sprintf_s(logBuf, "SEND: got slot info: base=0x%llX token=0x%X slots=%lu",
+                remoteBaseAddr, remoteToken, usedSlots);
+            DbgLog(logBuf);
+        }
 
         // ---- Pre-post credit Recvs --------------------------------------------
         // Must come BEFORE DONE Recv so that credit Sends from the receiver
@@ -471,15 +490,16 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
                 SET_ERROR("ReadFile failed"); ret = -1; break;
             }
 
-            // 4. RDMA Write chunk into receiver's ring buffer slot
-            UINT64 remoteAddr = remoteBaseAddr + (UINT64)slot * CHUNK_SIZE;
-            ND2_SGE writeSge = {}; writeSge.Buffer = pChunk;
-            writeSge.BufferLength = toRead; writeSge.MemoryRegionToken = localToken;
-            hr = ctx.pQp->Write(CHUNK_WRITE_CTX, &writeSge, 1,
-                remoteAddr, remoteToken, ND_OP_FLAG_SILENT_SUCCESS);
-            if (FAILED(hr)) { SET_ERROR("RDMA Write failed"); ret = -1; break; }
-            // Write is fire-and-forget (SILENT_SUCCESS). QP ordering guarantees
-            // the data arrives at the remote buffer before the doorbell below.
+            // 4. Write data: either RDMA Write (Write mode) or stay in local buffer (Read mode)
+            if (!g_is_read) {
+                UINT64 remoteAddr = remoteBaseAddr + (UINT64)slot * CHUNK_SIZE;
+                ND2_SGE writeSge = {}; writeSge.Buffer = pChunk;
+                writeSge.BufferLength = toRead; writeSge.MemoryRegionToken = localToken;
+                hr = ctx.pQp->Write(CHUNK_WRITE_CTX, &writeSge, 1,
+                    remoteAddr, remoteToken, ND_OP_FLAG_SILENT_SUCCESS);
+                if (FAILED(hr)) { SET_ERROR("RDMA Write failed"); ret = -1; break; }
+            }
+            // Read mode: data stays in pChunk, receiver will RDMA Read it
 
             // 5. Send doorbell: tell receiver "slot X has Y bytes of data"
             pDoorbell->slot_index = slot;
@@ -672,7 +692,8 @@ static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath
     DbgLog("RECV: total buf allocated (single MR)");
 
     hr = ctx.pMr->Register(pBuf, totalBufSize,
-        ND_MR_FLAG_ALLOW_LOCAL_WRITE | ND_MR_FLAG_ALLOW_REMOTE_WRITE, &ctx.ov);
+        ND_MR_FLAG_ALLOW_LOCAL_WRITE | ND_MR_FLAG_ALLOW_REMOTE_WRITE |
+        (g_is_read ? ND_MR_FLAG_ALLOW_REMOTE_READ : 0), &ctx.ov);
     if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pMr, &ctx.ov);
     if (FAILED(hr)) { SET_ERROR("Register total buf"); CleanupNd(ctx); return -1; }
     UINT32 ctrlToken = ctx.pMr->GetLocalToken();
@@ -712,7 +733,7 @@ static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath
         if (FAILED(hr)) { SET_ERROR("GetConnectionRequest"); ret = -1; break; }
         DbgLog("RECV: got connection request");
 
-        hr = ctx.pConnector->Accept(ctx.pQp, 0, 0, nullptr, 0, &ctx.ov);
+        hr = ctx.pConnector->Accept(ctx.pQp, g_is_read ? 16 : 0, 0, nullptr, 0, &ctx.ov);
         if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
         if (FAILED(hr)) { ret = -1; break; }
         DbgLog("RECV: accepted");
@@ -768,18 +789,35 @@ static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath
         hr = ctx.pQp->Receive(DONE_RECV_CTX, &doneSge, 1);
         if (FAILED(hr)) { ret = -1; break; }
 
-        // ---- Send SlotInfo to sender (ring buffer details) --------------------
-        pSlotInfo->base_addr   = ringBase;
-        pSlotInfo->remote_token = remoteToken;
-        pSlotInfo->num_slots    = NUM_SLOTS;
-        ND2_SGE slotInfoSge = {}; slotInfoSge.Buffer = pSlotInfo;
-        slotInfoSge.BufferLength = sizeof(SlotInfo);
-        slotInfoSge.MemoryRegionToken = ctrlToken;
-        hr = ctx.pQp->Send(SLOTINFO_SEND_CTX, &slotInfoSge, 1, 0);
-        if (FAILED(hr)) { ret = -1; break; }
-        while (ctx.pCq->GetResults(&cqResult, 1) == 0 && !IsCancelled()) {}
-        if (IsCancelled() || cqResult.Status != ND_SUCCESS) { ret = -1; break; }
-        DbgLog("RECV: sent SlotInfo to sender");
+        // ---- Exchange ring buffer info (role depends on Read/Write mode) ----
+        UINT64 remoteBaseAddr = 0;
+        UINT32 remoteTokenForRead = 0;
+        if (g_is_read) {
+            // Read mode: receive ring buffer info from sender
+            ND2_SGE siSge = {}; siSge.Buffer = pSlotInfo;
+            siSge.BufferLength = sizeof(SlotInfo); siSge.MemoryRegionToken = ctrlToken;
+            hr = ctx.pQp->Receive(SLOTINFO_RECV_CTX, &siSge, 1);
+            if (FAILED(hr)) { ret = -1; break; }
+            if (!WaitForCompletion(ctx.pCq, &ctx.ov, cqResult)) { ret = -1; break; }
+            if (cqResult.Status != ND_SUCCESS ||
+                cqResult.RequestContext != SLOTINFO_RECV_CTX) { ret = -1; break; }
+            remoteBaseAddr = pSlotInfo->base_addr;
+            remoteTokenForRead = pSlotInfo->remote_token;
+            DbgLog("RECV: got sender ring buffer info (Read mode)");
+        } else {
+            // Write mode: send ring buffer info to sender
+            pSlotInfo->base_addr   = ringBase;
+            pSlotInfo->remote_token = remoteToken;
+            pSlotInfo->num_slots    = NUM_SLOTS;
+            ND2_SGE slotInfoSge = {}; slotInfoSge.Buffer = pSlotInfo;
+            slotInfoSge.BufferLength = sizeof(SlotInfo);
+            slotInfoSge.MemoryRegionToken = ctrlToken;
+            hr = ctx.pQp->Send(SLOTINFO_SEND_CTX, &slotInfoSge, 1, 0);
+            if (FAILED(hr)) { ret = -1; break; }
+            while (ctx.pCq->GetResults(&cqResult, 1) == 0 && !IsCancelled()) {}
+            if (IsCancelled() || cqResult.Status != ND_SUCCESS) { ret = -1; break; }
+            DbgLog("RECV: sent SlotInfo to sender");
+        }
 
         // Fire metadata callback (filename + size)
         FireMetadata(pMeta->filename, fileSize);
@@ -818,6 +856,26 @@ static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath
 
                 if (slot >= NUM_SLOTS || dataSize > CHUNK_SIZE || dataSize == 0) {
                     SET_ERROR("Invalid doorbell"); ret = -1; break;
+                }
+
+                // Read mode: RDMA Read from sender's buffer first
+                if (g_is_read) {
+                    UINT64 srcAddr = remoteBaseAddr + (UINT64)slot * CHUNK_SIZE;
+                    ND2_SGE readSge = {}; readSge.Buffer = (char*)pRingBuf + (size_t)slot * CHUNK_SIZE;
+                    readSge.BufferLength = dataSize; readSge.MemoryRegionToken = ctrlToken;
+                    HRESULT hr2 = ctx.pQp->Read((void*)0x7002, &readSge, 1,
+                        srcAddr, remoteTokenForRead, 0);
+                    if (FAILED(hr2)) { SET_ERROR("RDMA Read failed"); ret = -1; break; }
+                    ND2_RESULT readRes = {};
+                    while (ctx.pCq->GetResults(&readRes, 1) == 0) {
+                        if (IsCancelled()) { ret = -1; diskError = true; break; }
+                        ctx.pCq->Notify(ND_CQ_NOTIFY_ANY, &ctx.ov);
+                        ctx.pCq->GetOverlappedResult(&ctx.ov, TRUE);
+                    }
+                    if (readRes.Status != ND_SUCCESS) {
+                        sprintf_s(logBuf, "RECV: Read error=0x%08X", readRes.Status);
+                        SET_ERROR(logBuf); ret = -1; break;
+                    }
                 }
 
                 // Write data from ring buffer slot to disk
