@@ -13,9 +13,9 @@
 | 分组 | 函数 |
 |---|---|
 | [生命周期](#生命周期) | `rdma_transfer_init`, `rdma_transfer_cleanup` |
-| [文件传输](#文件传输) | `rdma_send_file`, `rdma_recv_file` |
-| [共享内存监控](#共享内存监控) | `rdma_mem_start`, `rdma_mem_write`, `rdma_mem_staging`, `rdma_mem_write_from_staging`, `rdma_mem_write_from_staging_silent`, `rdma_mem_buffer`, `rdma_mem_size`, `rdma_mem_wait`, `rdma_mem_last_write`, `rdma_mem_stop_mode`, `rdma_mem_stop` |
-| [性能测试](#性能测试) | `rdma_bench` |
+| [文件传输](#文件传输) | `rdma_send_file`, `rdma_recv_file`, `rdma_send_file_ex`, `rdma_recv_file_ex` |
+| [共享内存监控](#共享内存监控) | `rdma_mem_start`, `rdma_mem_start_ex`, `rdma_mem_write`, `rdma_mem_staging`, `rdma_mem_write_from_staging`, `rdma_mem_write_from_staging_silent`, `rdma_mem_buffer`, `rdma_mem_size`, `rdma_mem_wait`, `rdma_mem_last_write`, `rdma_mem_stop` |
+| [性能测试](#性能测试) | `rdma_bench`, `rdma_bench_ex` |
 | [回调](#回调) | `rdma_set_progress_callback`, `rdma_set_metadata_callback` |
 | [控制](#控制) | `rdma_transfer_cancel` |
 | [枚举](#枚举) | `rdma_list_adapters` |
@@ -101,6 +101,46 @@ int rdma_recv_file(
 
 ---
 
+### `rdma_send_file_ex`
+
+```c
+int rdma_send_file_ex(
+    const char*    remote_ip,
+    unsigned short port,
+    const wchar_t* file_path,
+    int            use_read      // 0 = RDMA Write (push), 1 = RDMA Read (pull)
+);
+```
+
+`rdma_send_file` 的扩展版，支持选择传输方向。Read 模式下接收端主动 Pull 数据，发送端 CPU 在数据路径上零参与。
+
+| 属性 | 值 |
+|---|---|
+| 返回值 | `0` 成功, `-1` 失败 |
+| 可取消 | `rdma_transfer_cancel()` |
+| 进度 | `rdma_set_progress_callback` |
+
+### `rdma_recv_file_ex`
+
+```c
+int rdma_recv_file_ex(
+    const char*    local_ip,
+    unsigned short port,
+    const wchar_t* output_path,
+    int            use_read      // 0 = RDMA Write (push), 1 = RDMA Read (pull)
+);
+```
+
+`rdma_recv_file` 的扩展版。Read 模式下接收端通过 RDMA Read 从发送端拉取数据。
+
+| 属性 | 值 |
+|---|---|
+| 返回值 | `0` 成功, `-1` 失败 |
+| 可取消 | `rdma_transfer_cancel()` |
+| 进度 | `rdma_set_progress_callback` |
+
+---
+
 ## 共享内存监控
 
 一端（写入器）通过 **RDMA Write** 直接写入另一端（显示器）的共享缓冲区，显示器实时看到数据变化——接收端 CPU 在数据路径上完全为零介入。
@@ -126,6 +166,20 @@ int rdma_mem_start(int mode, const char* ip, unsigned short port, unsigned int s
 |---|---|
 | `0` | 成功 |
 | `-1` | 失败（可用 `rdma_transfer_last_error()` 获取错误信息） |
+
+### `rdma_mem_start_ex`
+
+```c
+int rdma_mem_start_ex(int mode, const char* ip, unsigned short port, unsigned int size_bytes, int use_read);
+```
+
+扩展版，支持选择传输方向。
+
+| 参数 | 说明 |
+|---|---|
+| `use_read` | `0` = RDMA Write 模式（写入器推送，默认）, `1` = RDMA Read 模式（显示器拉取） |
+
+Read 模式下角色反转：写入器监听连接并拥有缓冲区，显示器连接后通过 `rdma_mem_wait()` 触发 RDMA Read 拉取数据。
 
 ### `rdma_mem_write`
 
