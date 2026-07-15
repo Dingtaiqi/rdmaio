@@ -29,6 +29,7 @@
 
 static const USHORT DEFAULT_PORT = 54321;
 static const DWORD CHUNK_SIZE = 4 * 1024 * 1024;      // 4 MiB for better throughput
+static bool g_isRead = false;   // global flag for RDMA Read bench mode
 static const DWORD CQ_DEPTH = 256;
 static const DWORD QP_DEPTH = 128;      // maximum pipeline depth
 static const DWORD ALIGNMENT = 4096;
@@ -76,15 +77,11 @@ static void CleanupNd(NdContext& ctx)
 {
     HRESULT hr;
 
-    // 复用自 D:\rdma\NetworkDirect\src\examples\ndtestutil\ndtestutil.cpp 的析构与 Shutdown 顺序，
-    // 并按要求调整为：DeregisterMemory -> Disconnect -> CloseCQ -> CloseAdapter -> NdCleanup。
-    if (ctx.pMr != nullptr)
-    {
-        hr = ctx.pMr->Deregister(&ctx.ov);
-        if (hr == ND_PENDING)
-        {
-            ctx.pMr->GetOverlappedResult(&ctx.ov, TRUE);
-        }
+    // Drain CQ first per Microsoft NetworkDirect Disconnect 方案:
+    // "QP 上的所有 DMA 活动都已完成" 后才能调用 Disconnect。
+    if (ctx.pCq != nullptr) {
+        ND2_RESULT drain[16];
+        while (ctx.pCq->GetResults(drain, ARRAYSIZE(drain)) > 0) {}
     }
 
     if (ctx.pConnector != nullptr)
@@ -93,6 +90,15 @@ static void CleanupNd(NdContext& ctx)
         if (hr == ND_PENDING)
         {
             ctx.pConnector->GetOverlappedResult(&ctx.ov, TRUE);
+        }
+    }
+
+    if (ctx.pMr != nullptr)
+    {
+        hr = ctx.pMr->Deregister(&ctx.ov);
+        if (hr == ND_PENDING)
+        {
+            ctx.pMr->GetOverlappedResult(&ctx.ov, TRUE);
         }
     }
 
@@ -1041,6 +1047,7 @@ static int RunBenchReceiver(const wchar_t* localIp)
     int ret = 0;
     NdContext ctx;
     void* pBuf = nullptr;
+    IND2MemoryWindow* pMw = nullptr;
 
     WSADATA wsaData;
     int wsaRet = WSAStartup(MAKEWORD(2, 2), &wsaData);
@@ -1083,13 +1090,23 @@ static int RunBenchReceiver(const wchar_t* localIp)
         const DWORD benchBufSize = 512 * 1024 * 1024;  // 512 MB
         pBuf = AllocAligned(benchBufSize);
         if (!pBuf) { ret = -1; break; }
+        printf("[BENCH-RECV] memset 512MB...\n"); fflush(stdout);
         memset(pBuf, 0xAB, benchBufSize);
+        printf("[BENCH-RECV] Register 512MB MR...\n"); fflush(stdout);
 
         hr = ctx.pMr->Register(pBuf, benchBufSize,
-            ND_MR_FLAG_ALLOW_LOCAL_WRITE | ND_MR_FLAG_ALLOW_REMOTE_WRITE, &ctx.ov);
+            ND_MR_FLAG_ALLOW_LOCAL_WRITE | ND_MR_FLAG_ALLOW_REMOTE_WRITE | ND_MR_FLAG_ALLOW_REMOTE_READ, &ctx.ov);
         if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pMr, &ctx.ov);
         if (FAILED(hr)) { printf("Register: 0x%08X\n", hr); ret = -1; break; }
         UINT32 localToken = ctx.pMr->GetLocalToken();
+
+        // Query adapter for InboundReadLimit (required for RDMA Read)
+        ND2_ADAPTER_INFO adapterInfo = {};
+        adapterInfo.InfoVersion = ND_VERSION_2;
+        ULONG aiSize = sizeof(adapterInfo);
+        ctx.pAdapter->Query(&adapterInfo, &aiSize);
+        ULONG inboundReadLimit = adapterInfo.MaxInboundReadLimit;
+        if (inboundReadLimit == 0) inboundReadLimit = 16; // safe default
 
         // Listen & Accept
         hr = ctx.pAdapter->CreateListener(IID_IND2Listener,
@@ -1110,18 +1127,37 @@ static int RunBenchReceiver(const wchar_t* localIp)
         if (FAILED(hr)) { printf("GetConnectionRequest: 0x%08X\n", hr); ret = -1; break; }
         printf("[BENCH-RECV] Connection request received\n"); fflush(stdout);
 
-        hr = ctx.pConnector->Accept(ctx.pQp, 0, 0, nullptr, 0, &ctx.ov);
+        hr = ctx.pConnector->Accept(ctx.pQp, inboundReadLimit, 0, nullptr, 0, &ctx.ov);
         if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
         if (FAILED(hr)) { printf("Accept: 0x%08X\n", hr); ret = -1; break; }
         printf("[BENCH-RECV] Accept OK\n"); fflush(stdout);
 
-        // Send remote memory info to sender (use registered buffer, not stack)
-        printf("[BENCH-RECV] Sending peer info...\n"); fflush(stdout);
+        // For RDMA Read: create Memory Window and bind (ndrping pattern)
+        UINT32 remoteToken;
+        if (g_isRead) {
+            hr = ctx.pAdapter->CreateMemoryWindow(IID_IND2MemoryWindow,
+                reinterpret_cast<void**>(&pMw));
+            if (FAILED(hr)) { printf("CreateMW: 0x%08X\n", hr); ret = -1; break; }
+            hr = ctx.pQp->Bind((void*)0x7001, ctx.pMr, pMw, pBuf, benchBufSize,
+                ND_OP_FLAG_ALLOW_READ);
+            if (FAILED(hr)) { printf("Bind MW: 0x%08X\n", hr); ret = -1; break; }
+            ND2_RESULT bres = {};
+            while (ctx.pCq->GetResults(&bres, 1) == 0) {
+                ctx.pCq->Notify(ND_CQ_NOTIFY_ANY, &ctx.ov);
+                ctx.pCq->GetOverlappedResult(&ctx.ov, TRUE);
+            }
+            if (bres.Status != ND_SUCCESS) {
+                printf("Bind MW: 0x%08X\n", bres.Status); ret = -1; break;
+            }
+            remoteToken = pMw->GetRemoteToken();
+        } else {
+            remoteToken = ctx.pMr->GetRemoteToken();
+        }
+
+        // Send memory info to sender
         BenchPeerInfo* pInfo = static_cast<BenchPeerInfo*>(pBuf);
         pInfo->remoteAddress = reinterpret_cast<UINT64>(pBuf);
-        pInfo->remoteToken = ctx.pMr->GetRemoteToken();
-        printf("[BENCH-RECV] token=0x%08X addr=0x%llX\n", pInfo->remoteToken, pInfo->remoteAddress); fflush(stdout);
-
+        pInfo->remoteToken = remoteToken;
         ND2_SGE sge = {};
         sge.Buffer = pInfo;
         sge.BufferLength = sizeof(BenchPeerInfo);
@@ -1153,6 +1189,7 @@ static int RunBenchReceiver(const wchar_t* localIp)
     } while (0);
 
 done:
+    if (pMw != nullptr) { pMw->Release(); pMw = nullptr; }
     FreeAligned(pBuf);
     CleanupNd(ctx);   // must release ND objects before NdCleanup
     NdCleanup();
@@ -1160,7 +1197,7 @@ done:
     return ret;
 }
 
-static int RunBenchSender(const wchar_t* remoteIp)
+static int RunBenchSender(const wchar_t* remoteIp, bool isRead)
 {
     int ret = 0;
     NdContext ctx;
@@ -1227,10 +1264,10 @@ static int RunBenchSender(const wchar_t* remoteIp)
         const DWORD benchBufSize = 512 * 1024 * 1024;  // 512 MB
         pBuf = AllocAligned(benchBufSize);
         if (!pBuf) { ret = -1; break; }
-        printf("[BENCH-SEND] AllocAligned OK (%lu MB)\n", benchBufSize/(1024*1024)); fflush(stdout);
 
         hr = ctx.pMr->Register(pBuf, benchBufSize,
-            ND_MR_FLAG_ALLOW_LOCAL_WRITE, &ctx.ov);
+            ND_MR_FLAG_ALLOW_LOCAL_WRITE |
+            (isRead ? ND_MR_FLAG_RDMA_READ_SINK : 0), &ctx.ov);
         if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pMr, &ctx.ov);
         if (FAILED(hr)) { printf("Register: 0x%08X\n", hr); ret = -1; break; }
         printf("[BENCH-SEND] Register OK\n"); fflush(stdout);
@@ -1247,7 +1284,7 @@ static int RunBenchSender(const wchar_t* remoteIp)
         printf("[BENCH-SEND] Connecting to %ls...\n", remoteIp); fflush(stdout);
         hr = ctx.pConnector->Connect(ctx.pQp,
             reinterpret_cast<const struct sockaddr*>(&remoteAddr), sizeof(remoteAddr),
-            0, 0, nullptr, 0, &ctx.ov);
+            0, isRead ? 16 : 0, nullptr, 0, &ctx.ov);
         if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
         if (FAILED(hr)) { printf("Connect: 0x%08X\n", hr); ret = -1; break; }
         printf("[BENCH-SEND] Connect OK\n"); fflush(stdout);
@@ -1295,27 +1332,37 @@ static int RunBenchSender(const wchar_t* remoteIp)
         printf("Remote memory: token=0x%08X, addr=0x%llX\n",
                pPeer->remoteToken, pPeer->remoteAddress);
 
-        // RDMA Write benchmark — single giant write for maximum throughput.
-        // The adapter supports up to 1024 MB per transfer.
+        // RDMA Write/Read benchmark — single giant transfer for maximum throughput.
+        // Note: RDMA Read via MW not functional on ConnectX-3 Pro (mlx4).
         const DWORD TOTAL_BYTES = benchBufSize;
-        DWORD writeSize = TOTAL_BYTES;
+        DWORD xferSize = TOTAL_BYTES;
 
         sge.Buffer = pBuf;
-        sge.BufferLength = writeSize;
+        sge.BufferLength = xferSize;
 
         LARGE_INTEGER freq, tStart, tEnd;
         QueryPerformanceFrequency(&freq);
         QueryPerformanceCounter(&tStart);
 
-        // One giant RDMA Write
-        hr = ctx.pQp->Write((void*)0x6001, &sge, 1,
-            pPeer->remoteAddress, pPeer->remoteToken, 0);
-        if (FAILED(hr)) {
-            printf("Giant Write failed: 0x%08X\n", hr); ret = -1;
+        // One giant RDMA Write or Read
+        const char* opName = isRead ? "Read" : "Write";
+        if (isRead) {
+            hr = ctx.pQp->Read((void*)0x6001, &sge, 1,
+                pPeer->remoteAddress, pPeer->remoteToken, 0);
         } else {
-            while (ctx.pCq->GetResults(&result, 1) == 0) {}
+            hr = ctx.pQp->Write((void*)0x6001, &sge, 1,
+                pPeer->remoteAddress, pPeer->remoteToken, 0);
+        }
+        if (FAILED(hr)) {
+            printf("Giant %s failed: 0x%08X\n", opName, hr); ret = -1;
+        } else {
+            // Use Notify-based wait like ndrping's blocking mode
+            while (ctx.pCq->GetResults(&result, 1) == 0) {
+                ctx.pCq->Notify(ND_CQ_NOTIFY_ANY, &ctx.ov);
+                ctx.pCq->GetOverlappedResult(&ctx.ov, TRUE);
+            }
             if (result.Status != ND_SUCCESS) {
-                printf("Write completion error: 0x%08X\n", result.Status);
+                printf("%s completion error: 0x%08X\n", opName, result.Status);
                 ret = -1;
             }
         }
@@ -1328,9 +1375,13 @@ static int RunBenchSender(const wchar_t* remoteIp)
         double speedGbps = speedMBps * 8.0 / 1000.0;
         double speedGBps = speedMBps / 1000.0;
 
-        printf("\n=== RDMA Write Benchmark (1 giant write) ===\n");
+        printf("\n=== %s Benchmark (1 giant %s) ===\n",
+               isRead ? "RDMA Read" : "RDMA Write",
+               isRead ? "read" : "write");
         printf("  Total:       %.2f MB\n", totalMb);
-        printf("  Write:       %.2f MB x 1\n", (double)writeSize / (1024.0 * 1024.0));
+        printf("  %s:       %.2f MB x 1\n",
+               isRead ? "Read" : "Write",
+               (double)xferSize / (1024.0 * 1024.0));
         printf("  Time:        %.2f ms\n", elapsed * 1000.0);
         printf("  Throughput:  %.2f MB/s  (%.2f Gbps, %.2f GB/s)\n",
                speedMBps, speedGbps, speedGBps);
@@ -1371,6 +1422,10 @@ int wmain(int argc, wchar_t* argv[])
         {
             isBench = true;
         }
+        else if (wcscmp(argv[i], L"-read") == 0)
+        {
+            g_isRead = true;
+        }
         else if (wcscmp(argv[i], L"-ip") == 0)
         {
             if (i + 1 >= argc) { PrintUsage(argv[0]); return -1; }
@@ -1397,7 +1452,7 @@ int wmain(int argc, wchar_t* argv[])
     if (isBench)
     {
         if (ip == nullptr) { PrintUsage(argv[0]); return -1; }
-        if (isSend) return RunBenchSender(ip);
+        if (isSend) return RunBenchSender(ip, g_isRead);
         if (isRecv) return RunBenchReceiver(ip);
         PrintUsage(argv[0]);
         return -1;

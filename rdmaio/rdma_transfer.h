@@ -64,6 +64,28 @@ RDMA_TRANSFER_API int rdma_bench(
     unsigned short port,
     int           size_mb);
 
+// Extended bench: use_read=0 (Write, default), use_read=1 (RDMA Read)
+RDMA_TRANSFER_API int rdma_bench_ex(
+    int           side,
+    const char*   ip,
+    unsigned short port,
+    int           size_mb,
+    int           use_read);
+
+// Extended file transfer with direction select: use_read=0 (Write, default), use_read=1 (Read)
+// Read mode: receiver pulls data from sender (zero sender CPU on data path)
+RDMA_TRANSFER_API int rdma_send_file_ex(
+    const char*  remote_ip,
+    unsigned short port,
+    const wchar_t* file_path,
+    int use_read);
+
+RDMA_TRANSFER_API int rdma_recv_file_ex(
+    const char*  local_ip,
+    unsigned short port,
+    const wchar_t* output_path,
+    int use_read);
+
 // ---- Progress Callback ---------------------------------------------------
 // Signature: void callback(double percent, double speed_mbps, void* user_data)
 typedef void (*rdma_progress_cb)(double percent, double speed_mbps, void* user_data);
@@ -133,6 +155,10 @@ RDMA_TRANSFER_API int rdma_list_adapters(
 //   size_bytes: size of the shared memory buffer
 // Returns 0 on success, -1 on error.
 RDMA_TRANSFER_API int rdma_mem_start(int mode, const char* ip, unsigned short port, unsigned int size_bytes);
+
+// Extended version: use_read=0 (RDMA Write, default), use_read=1 (RDMA Read mode)
+// Read mode: writer owns buffer, display RDMA Reads for updates
+RDMA_TRANSFER_API int rdma_mem_start_ex(int mode, const char* ip, unsigned short port, unsigned int size_bytes, int use_read);
 
 // Writer: write data into the remote shared buffer at given offset.
 //   offset: byte offset from start of shared buffer

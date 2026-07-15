@@ -99,6 +99,7 @@ static void*             g_metadata_ctx = nullptr;
 static volatile LONG     g_cancel_flag  = 0;
 static LONG              g_init_count   = 0;
 static char              g_last_error[256] = "";
+static int               g_is_read      = 0;   // global flag for RDMA Read mode
 
 #define SET_ERROR(msg) do { \
     strcpy_s(g_last_error, sizeof(g_last_error), msg); \
@@ -150,17 +151,29 @@ static HRESULT WaitOverlapped(IND2Overlapped* pObj, OVERLAPPED* pOv) {
     return pObj->GetOverlappedResult(pOv, TRUE);
 }
 
+// Blocking CQ wait using Notify-based event (Microsoft ndtestutil pattern).
+// Returns when a completion is available or cancelled.
+// Avoids busy-wait spinning.
+static bool WaitForCompletion(IND2CompletionQueue* pCq, OVERLAPPED* pOv, ND2_RESULT& result) {
+    if (!pCq) return false;
+    for (;;) {
+        if (InterlockedCompareExchange(&g_cancel_flag, 0, 0)) return false;
+        if (pCq->GetResults(&result, 1) == 1) return true;
+        HRESULT hr = pCq->Notify(ND_CQ_NOTIFY_ANY, pOv);
+        if (hr == ND_PENDING) {
+            pCq->GetOverlappedResult(pOv, TRUE);
+        }
+    }
+}
+
 static void CleanupNd(NdContext& ctx) {
     HRESULT hr;
-    // 复用自 D:\rdma\NetworkDirect\src\examples\ndtestutil\ndtestutil.cpp 的析构与 Shutdown 顺序，
-    // 并按要求调整为：DeregisterMemory -> Disconnect -> CloseCQ -> CloseAdapter -> NdCleanup。
-    if (ctx.pMr != nullptr)
-    {
-        hr = ctx.pMr->Deregister(&ctx.ov);
-        if (hr == ND_PENDING)
-        {
-            ctx.pMr->GetOverlappedResult(&ctx.ov, TRUE);
-        }
+
+    // Drain the CQ before Disconnect to satisfy the NetworkDirect requirement
+    // that "QP 上的所有 DMA 活动都已完成" before calling NdDisconnect.
+    if (ctx.pCq != nullptr) {
+        ND2_RESULT drain[16];
+        while (ctx.pCq->GetResults(drain, ARRAYSIZE(drain)) > 0) {}
     }
 
     if (ctx.pConnector != nullptr)
@@ -169,6 +182,15 @@ static void CleanupNd(NdContext& ctx) {
         if (hr == ND_PENDING)
         {
             ctx.pConnector->GetOverlappedResult(&ctx.ov, TRUE);
+        }
+    }
+
+    if (ctx.pMr != nullptr)
+    {
+        hr = ctx.pMr->Deregister(&ctx.ov);
+        if (hr == ND_PENDING)
+        {
+            ctx.pMr->GetOverlappedResult(&ctx.ov, TRUE);
         }
     }
 
@@ -316,12 +338,6 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
         hr = ctx.pQp->Receive(SLOTINFO_RECV_CTX, &slotInfoSge, 1);
         if (FAILED(hr)) { ret = -1; break; }
 
-        // Post Recv for DONE (transfer-complete signal from receiver)
-        ND2_SGE doneSge = {}; doneSge.Buffer = pDoneBuf;
-        doneSge.BufferLength = sizeof(uint32_t); doneSge.MemoryRegionToken = localToken;
-        hr = ctx.pQp->Receive(DONE_RECV_CTX, &doneSge, 1);
-        if (FAILED(hr)) { ret = -1; break; }
-
         hr = ctx.pConnector->CompleteConnect(&ctx.ov);
         if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
         if (FAILED(hr)) { SET_ERROR("CompleteConnect failed"); ret = -1; break; }
@@ -352,11 +368,11 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
         hr = ctx.pQp->Send(META_SEND_CTX, &metaSge, 1, 0);
         if (FAILED(hr)) { SET_ERROR("Send metadata failed"); ret = -1; break; }
         ND2_RESULT cqResult = {};
-        while (ctx.pCq->GetResults(&cqResult, 1) == 0 && !IsCancelled()) {}
-        if (IsCancelled() || cqResult.Status != ND_SUCCESS) { ret = -1; break; }
+        if (!WaitForCompletion(ctx.pCq, &ctx.ov, cqResult)) { ret = -1; break; }
+        if (cqResult.Status != ND_SUCCESS) { ret = -1; break; }
 
         // 2. Wait for SlotInfo from receiver (remote buffer layout)
-        while (ctx.pCq->GetResults(&cqResult, 1) == 0 && !IsCancelled()) {}
+        if (!WaitForCompletion(ctx.pCq, &ctx.ov, cqResult)) { ret = -1; break; }
         if (IsCancelled() || cqResult.Status != ND_SUCCESS ||
             cqResult.RequestContext != SLOTINFO_RECV_CTX) { ret = -1; break; }
         UINT64 remoteBaseAddr = pSlotInfo->base_addr;
@@ -369,9 +385,8 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
         DbgLog(logBuf);
 
         // ---- Pre-post credit Recvs --------------------------------------------
-        // We need one Recv per slot to accept credit messages from receiver.
-        // Each credit Recv uses a unique context so we know which buf was filled.
-        // Place them AFTER the slotInfo + done recvs in the Recv queue.
+        // Must come BEFORE DONE Recv so that credit Sends from the receiver
+        // match a credit Recv, not the DONE Recv, in the Recv queue.
         ND2_SGE creditSge = {}; creditSge.MemoryRegionToken = localToken;
         for (uint32_t i = 0; i < usedSlots; i++) {
             creditSge.Buffer = &creditRecvs[i];
@@ -381,6 +396,13 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
         }
         if (ret) break;
         DbgLog("SEND: posted credit Recvs");
+
+        // Post Recv for DONE (transfer-complete signal from receiver).
+        // Must come AFTER the credit Recvs.
+        ND2_SGE doneSge = {}; doneSge.Buffer = pDoneBuf;
+        doneSge.BufferLength = sizeof(uint32_t); doneSge.MemoryRegionToken = localToken;
+        hr = ctx.pQp->Receive(DONE_RECV_CTX, &doneSge, 1);
+        if (FAILED(hr)) { SET_ERROR("Post DONE Recv failed"); ret = -1; break; }
 
         // ---- Initialize free-slot tracking -------------------------------------
         // At any point: freeCount = number of slots the sender may write to.
@@ -469,8 +491,7 @@ static int InternalSend(const char* remoteIp, USHORT port, const wchar_t* filePa
             if (FAILED(hr)) { SET_ERROR("Send doorbell failed"); ret = -1; break; }
 
             // 6. Wait for doorbell Send CQ
-            while (ctx.pCq->GetResults(&cqResult, 1) == 0 && !IsCancelled()) {}
-            if (IsCancelled()) { ret = -1; break; }
+            if (!WaitForCompletion(ctx.pCq, &ctx.ov, cqResult)) { ret = -1; break; }
             if (cqResult.Status != ND_SUCCESS) {
                 sprintf_s(logBuf, "SEND: doorbell CQ=0x%08X (Write may have failed)", cqResult.Status);
                 SET_ERROR(logBuf); ret = -1; break;
@@ -698,8 +719,8 @@ static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath
 
         // Wait for FileMeta
         ND2_RESULT cqResult = {};
-        while (ctx.pCq->GetResults(&cqResult, 1) == 0 && !IsCancelled()) {}
-        if (IsCancelled() || cqResult.Status != ND_SUCCESS ||
+        if (!WaitForCompletion(ctx.pCq, &ctx.ov, cqResult)) { ret = -1; break; }
+        if (cqResult.Status != ND_SUCCESS ||
             cqResult.RequestContext != META_RECV_CTX) { ret = -1; break; }
         uint64_t fileSize = pMeta->file_size;
         DbgLog("RECV: got metadata");
@@ -776,8 +797,7 @@ static int InternalRecv(const char* localIp, USHORT port, const wchar_t* outPath
 
         while (bytesReceived < fileSize && !diskError) {
             // Wait for doorbell or DONE
-            while (ctx.pCq->GetResults(&cqResult, 1) == 0 && !IsCancelled()) {}
-            if (IsCancelled()) { ret = -1; diskError = true; break; }
+            if (!WaitForCompletion(ctx.pCq, &ctx.ov, cqResult)) { ret = -1; diskError = true; break; }
 
             if (cqResult.Status != ND_SUCCESS) {
                 if (bytesReceived >= fileSize) {
@@ -918,8 +938,11 @@ static int InternalBenchRecv(const char* localIp, USHORT port, int sizeMb) {
     if (!pBuf) { CleanupNd(ctx); return -1; }
     memset(pBuf, 0xAB, benchBufSize);
 
-    hr = ctx.pMr->Register(pBuf, benchBufSize,
-        ND_MR_FLAG_ALLOW_LOCAL_WRITE | ND_MR_FLAG_ALLOW_REMOTE_WRITE, &ctx.ov);
+    {
+        ULONG mrFlags = ND_MR_FLAG_ALLOW_LOCAL_WRITE | ND_MR_FLAG_ALLOW_REMOTE_WRITE;
+        if (g_is_read) mrFlags |= ND_MR_FLAG_ALLOW_REMOTE_READ;
+        hr = ctx.pMr->Register(pBuf, benchBufSize, mrFlags, &ctx.ov);
+    }
     if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pMr, &ctx.ov);
     if (FAILED(hr)) { CleanupNd(ctx); FreeAligned(pBuf); return -1; }
 
@@ -1003,7 +1026,8 @@ static int InternalBenchSend(const char* remoteIp, USHORT port, int sizeMb) {
     pBuf = AllocAligned(benchBufSize);
     if (!pBuf) { CleanupNd(ctx); return -1; }
 
-    hr = ctx.pMr->Register(pBuf, benchBufSize, ND_MR_FLAG_ALLOW_LOCAL_WRITE, &ctx.ov);
+    hr = ctx.pMr->Register(pBuf, benchBufSize,
+        ND_MR_FLAG_ALLOW_LOCAL_WRITE | (g_is_read ? ND_MR_FLAG_RDMA_READ_SINK : 0), &ctx.ov);
     if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pMr, &ctx.ov);
     if (FAILED(hr)) { CleanupNd(ctx); FreeAligned(pBuf); return -1; }
 
@@ -1015,7 +1039,7 @@ static int InternalBenchSend(const char* remoteIp, USHORT port, int sizeMb) {
         if (FAILED(hr)) { ret = -1; break; }
 
         hr = ctx.pConnector->Connect(ctx.pQp, (const sockaddr*)&remoteAddr, sizeof(remoteAddr),
-                                      0, 0, nullptr, 0, &ctx.ov);
+                                      0, g_is_read ? 16 : 0, nullptr, 0, &ctx.ov);
         if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
         if (FAILED(hr)) { ret = -1; break; }
 
@@ -1051,8 +1075,13 @@ static int InternalBenchSend(const char* remoteIp, USHORT port, int sizeMb) {
             if (IsCancelled()) { ret = -1; break; }
             UINT64 offset = (UINT64)i * XFER_SIZE;
             DWORD flags = (i == writes - 1) ? 0 : ND_OP_FLAG_SILENT_SUCCESS;
-            hr = ctx.pQp->Write(BENCH_WRITE_CTX, &sge, 1,
-                pPeer->remoteAddress + offset, pPeer->remoteToken, flags);
+            if (g_is_read) {
+                hr = ctx.pQp->Read(BENCH_WRITE_CTX, &sge, 1,
+                    pPeer->remoteAddress + offset, pPeer->remoteToken, flags);
+            } else {
+                hr = ctx.pQp->Write(BENCH_WRITE_CTX, &sge, 1,
+                    pPeer->remoteAddress + offset, pPeer->remoteToken, flags);
+            }
             if (FAILED(hr)) { ret = -1; break; }
         }
 
@@ -1066,7 +1095,8 @@ static int InternalBenchSend(const char* remoteIp, USHORT port, int sizeMb) {
         double totalMb = (double)benchBufSize / (1024.0 * 1024.0);
         double mbps = elapsed > 0.0 ? (totalMb / elapsed) : 0.0;
 
-        printf("  RDMA Write: %.0f MB in %.1f ms  |  %.1f MB/s  (%.2f Gbps)\n",
+        printf("  RDMA %s: %.0f MB in %.1f ms  |  %.1f MB/s  (%.2f Gbps)\n",
+               g_is_read ? "Read" : "Write",
                totalMb, elapsed * 1000.0, mbps, mbps * 8.0 / 1000.0);
 
         FireProgress(benchBufSize, benchBufSize, elapsed);
@@ -1205,6 +1235,12 @@ static void MemCleanup() {
 
 RDMA_TRANSFER_API int rdma_mem_start(int mode, const char* ip, unsigned short port, unsigned int size_bytes)
 {
+    return rdma_mem_start_ex(mode, ip, port, size_bytes, 0);
+}
+
+RDMA_TRANSFER_API int rdma_mem_start_ex(int mode, const char* ip, unsigned short port, unsigned int size_bytes, int use_read)
+{
+    if (use_read) { SET_ERROR("RDMA Read mode not yet implemented for memory monitor"); return -1; }
     if (g_mem.mode >= 0) { SET_ERROR("Memory share already active"); return -1; }
     if (mode != 0 && mode != 1) { SET_ERROR("mode must be 0 (display) or 1 (writer)"); return -1; }
     if (size_bytes < 1 || size_bytes > 64 * 1024 * 1024) { SET_ERROR("size must be 1..64MB"); return -1; }
@@ -1477,20 +1513,47 @@ RDMA_TRANSFER_API void rdma_transfer_cleanup(void)
 
 RDMA_TRANSFER_API int rdma_send_file(const char* remote_ip, unsigned short port, const wchar_t* file_path)
 {
+    g_is_read = 0;
     return InternalSend(remote_ip, port, file_path);
+}
+
+RDMA_TRANSFER_API int rdma_send_file_ex(const char* remote_ip, unsigned short port, const wchar_t* file_path, int use_read)
+{
+    g_is_read = use_read;
+    int r = InternalSend(remote_ip, port, file_path);
+    g_is_read = 0;
+    return r;
 }
 
 RDMA_TRANSFER_API int rdma_recv_file(const char* local_ip, unsigned short port, const wchar_t* output_path)
 {
+    g_is_read = 0;
     return InternalRecv(local_ip, port, output_path);
+}
+
+RDMA_TRANSFER_API int rdma_recv_file_ex(const char* local_ip, unsigned short port, const wchar_t* output_path, int use_read)
+{
+    g_is_read = use_read;
+    int r = InternalRecv(local_ip, port, output_path);
+    g_is_read = 0;
+    return r;
 }
 
 RDMA_TRANSFER_API int rdma_bench(int side, const char* ip, unsigned short port, int size_mb)
 {
+    return rdma_bench_ex(side, ip, port, size_mb, 0);
+}
+
+RDMA_TRANSFER_API int rdma_bench_ex(int side, const char* ip, unsigned short port, int size_mb, int use_read)
+{
+    g_is_read = use_read;
+    int r;
     if (side == 1)
-        return InternalBenchSend(ip, port, size_mb);
+        r = InternalBenchSend(ip, port, size_mb);
     else
-        return InternalBenchRecv(ip, port, size_mb);
+        r = InternalBenchRecv(ip, port, size_mb);
+    g_is_read = 0;
+    return r;
 }
 
 RDMA_TRANSFER_API void rdma_set_progress_callback(rdma_progress_cb cb, void* user_data)

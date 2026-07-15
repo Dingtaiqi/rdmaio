@@ -14,7 +14,7 @@
 |---|---|
 | [生命周期](#生命周期) | `rdma_transfer_init`, `rdma_transfer_cleanup` |
 | [文件传输](#文件传输) | `rdma_send_file`, `rdma_recv_file` |
-| [共享内存监控](#共享内存监控) | `rdma_mem_start`, `rdma_mem_write`, `rdma_mem_buffer`, `rdma_mem_size`, `rdma_mem_wait`, `rdma_mem_last_write`, `rdma_mem_stop` |
+| [共享内存监控](#共享内存监控) | `rdma_mem_start`, `rdma_mem_write`, `rdma_mem_staging`, `rdma_mem_write_from_staging`, `rdma_mem_write_from_staging_silent`, `rdma_mem_buffer`, `rdma_mem_size`, `rdma_mem_wait`, `rdma_mem_last_write`, `rdma_mem_stop_mode`, `rdma_mem_stop` |
 | [性能测试](#性能测试) | `rdma_bench` |
 | [回调](#回调) | `rdma_set_progress_callback`, `rdma_set_metadata_callback` |
 | [控制](#控制) | `rdma_transfer_cancel` |
@@ -44,6 +44,16 @@ void rdma_transfer_cleanup(void);
 ```
 
 清理 RDMA 栈。引用计数归零时执行 `NdCleanup` → `WSACleanup`。
+
+> **注意**：`rdma_transfer_cleanup()` 只负责 ND 库的全局清理。如果后台仍有文件传输或共享内存会话在运行，必须先调用对应的停止/取消函数（如 `rdma_transfer_cancel()`、`rdma_mem_stop()`），否则 `CleanupNd()` 会自行 drain CQ 并等待 WR 完成后才 Disconnect，但仍建议由调用方显式停止。
+
+### NetworkDirect Disconnect 合规性
+
+本库在资源释放阶段遵循 [Microsoft NetworkDirect Disconnect 方案](https://learn.microsoft.com/zh-cn/windows-hardware/drivers/network/networkdirect-disconnect-scheme)：
+
+- `CleanupNd()` 内部会先 drain CQ，并等待所有已发布 WR（Send/Recv/Write）的完成通知，然后才调用 `IND2Connector::Disconnect`。
+- 共享内存写入器在 `rdma_mem_stop()` / `rdma_mem_stop_mode(1)` 时会自动 flush 未完成的 `ND_OP_FLAG_SILENT_SUCCESS` Write：发出一个 zero-length 非静默 Write，其 CQ 到达即保证所有前序静默写已完成。
+- 资源释放顺序：drain CQ → Disconnect → 释放 QP/CQ → Deregister MR → 释放 Adapter/句柄。
 
 ---
 
@@ -123,18 +133,59 @@ int rdma_mem_start(int mode, const char* ip, unsigned short port, unsigned int s
 int rdma_mem_write(unsigned int offset, const void* data, unsigned int len);
 ```
 
-**仅写入器端**。将数据写入远程共享缓冲区。内部先复制到 staging buffer，然后 RDMA Write + doorbell。
+**仅写入器端**。将数据写入远程共享缓冲区。内部先复制到 staging buffer，然后发起非静默 RDMA Write（等待 CQ 完成）。
 
 | 参数 | 说明 |
 |---|---|
 | `offset` | 写入偏移量（从共享缓冲区起始） |
 | `data` | 源数据指针 |
-| `len` | 数据长度（最大 4 MB） |
+| `len` | 数据长度（最大 16 MB） |
 
 | 返回值 | 含义 |
 |---|---|
 | `0` | 成功 |
 | `-1` | 失败 |
+
+### `rdma_mem_staging`
+
+```c
+void* rdma_mem_staging(void);
+```
+
+**仅写入器端**。返回默认 staging slot 指针（已在 MR 内注册，大小 16 MB）。用于零拷贝路径：
+
+1. 直接写数据到 `rdma_mem_staging()` 返回的地址。
+2. 调用 `rdma_mem_write_from_staging(offset, len)` 发起 RDMA Write。
+
+### `rdma_mem_write_from_staging`
+
+```c
+int rdma_mem_write_from_staging(unsigned int offset, unsigned int len);
+```
+
+**仅写入器端**。从默认 staging slot 发起非静默 RDMA Write。CQ 完成表示数据已到达远端，**同时保证此前所有静默写已完成**。
+
+### `rdma_mem_write_from_staging_silent`
+
+```c
+int rdma_mem_write_from_staging_silent(unsigned int offset, unsigned int len);
+```
+
+**仅写入器端**。从默认 staging slot 发起静默 RDMA Write（`ND_OP_FLAG_SILENT_SUCCESS`）。
+- 不生成 CQ 条目、不阻塞，适合批量连续写入。
+- **必须**以一次非静默写（`rdma_mem_write_from_staging`）或 `rdma_mem_stop()` / `rdma_mem_stop_mode(1)` 结束，以 flush 所有未完成的静默写。
+
+### 多 slot staging
+
+```c
+#define RDMA_STAGING_SLOT_COUNT 8
+
+void* rdma_mem_staging_slot(int slot_index);
+int   rdma_mem_write_from_staging_slot(int slot_index, unsigned int offset, unsigned int len);
+int   rdma_mem_write_from_staging_silent_slot(int slot_index, unsigned int offset, unsigned int len);
+```
+
+支持最多 8 个独立 staging slot。可在上一批数据仍在传输时准备下一批，避免覆盖 in-flight 数据。
 
 ### `rdma_mem_buffer`
 
@@ -180,13 +231,23 @@ void rdma_mem_last_write(unsigned int* out_offset, unsigned int* out_len);
 
 获取最近一次写入的偏移和长度。可在 `rdma_mem_wait()` 返回 `1` 后调用。
 
+### `rdma_mem_stop_mode`
+
+```c
+void rdma_mem_stop_mode(int mode);
+```
+
+停止指定模式的会话：`0` = 显示器，`1` = 写入器。与 `rdma_mem_stop()` 不同，它**不会**影响另一个模式，允许多会话独立启停。
+
+写入器模式停止前会自动 flush 所有未完成的静默写，确保 NetworkDirect Disconnect 规范要求的 "QP 上所有 DMA 活动完成" 后再断开连接。
+
 ### `rdma_mem_stop`
 
 ```c
 void rdma_mem_stop(void);
 ```
 
-停止共享内存会话并释放所有资源。幂等，可多次调用。
+停止**两个模式**的共享内存会话并释放所有资源（向后兼容行为）。幂等，可多次调用。
 
 ---
 
@@ -203,7 +264,7 @@ int rdma_bench(
 );
 ```
 
-纯内存 RDMA Write 带宽测试，**不涉及磁盘 I/O**。发送端输出：
+纯内存带宽测试（默认 RDMA Write），**不涉及磁盘 I/O**。发送端输出：
 
 ```
 RDMA Write: 1024 MB in 429.8 ms  |  2382.7 MB/s  (19.06 Gbps)
@@ -213,8 +274,32 @@ RDMA Write: 1024 MB in 429.8 ms  |  2382.7 MB/s  (19.06 Gbps)
 |---|---|
 | 返回值 | `0` 成功, `-1` 失败 |
 | 可取消 | `rdma_transfer_cancel()` |
-| 接收端 | 分配 `size_mb` MB 内存并注册为远端可写 |
-| 发送端 | 连续 RDMA Write + SILENT_SUCCESS |
+| 接收端 | 分配 `size_mb` MB 内存并注册为远端可写/可读 |
+| 发送端 | 连续 RDMA Write + SILENT_SUCCESS（默认） |
+
+### `rdma_bench_ex`
+
+```c
+int rdma_bench_ex(
+    int            side,         // 0 = 接收端, 1 = 发送端
+    const char*    ip,           // IP 地址
+    unsigned short port,         // 端口号
+    int            size_mb,      // 传输数据量 (MiB)
+    int            use_read      // 0 = RDMA Write (默认), 1 = RDMA Read
+);
+```
+
+扩展版，支持选择 Read 或 Write 模式。
+
+- RDMA Read 模式需要接收端注册 `ALLOW_REMOTE_READ`，发送端注册 `RDMA_READ_SINK`
+- 发送端 Connect 时自动设 `outboundReadLimit = 16`
+- 未经测试的硬件上 Read 可能返回 `STATUS_DATA_ERROR (0xC000003E)`
+
+输出示例：
+
+```
+RDMA Read: 512 MB in 230.0 ms  |  2225.7 MB/s  (17.81 Gbps)
+```
 
 ---
 
@@ -350,6 +435,26 @@ rdma_mem_start(1, "192.168.100.2", 54323, 65536);
 
 const char* msg = "Hello RDMA Write!";
 rdma_mem_write(0, msg, strlen(msg) + 1);
+
+rdma_mem_stop();
+rdma_transfer_cleanup();
+```
+
+```c
+// 写入器端 — 零拷贝批量写入（推荐高性能场景）
+rdma_transfer_init();
+rdma_mem_start(1, "192.168.100.2", 54323, 65536);
+
+// 写多批数据，除最后一批外全部用 silent
+for (int i = 0; i < 10; i++) {
+    void* staging = rdma_mem_staging();
+    memcpy(staging, payload[i], payload_size[i]);
+    if (i == 9) {
+        rdma_mem_write_from_staging(offsets[i], payload_size[i]); // 非静默，flush 前序 silent
+    } else {
+        rdma_mem_write_from_staging_silent(offsets[i], payload_size[i]);
+    }
+}
 
 rdma_mem_stop();
 rdma_transfer_cleanup();
