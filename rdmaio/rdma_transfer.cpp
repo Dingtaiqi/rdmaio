@@ -1211,9 +1211,9 @@ static struct MemShareState {
     UINT32    remoteToken  = 0;
     UINT64    remoteAddr   = 0;
     int       mode         = -1;        // 0=display, 1=writer
+    bool      useRead      = false;
     bool      connected    = false;
     MemDoorbellMsg lastDoorbell = {};
-    // Writer-side: pointer for doorbell send buffer (inside MR)
     MemDoorbellMsg* pDoorbellSend = nullptr;
 } g_mem;
 
@@ -1240,7 +1240,6 @@ RDMA_TRANSFER_API int rdma_mem_start(int mode, const char* ip, unsigned short po
 
 RDMA_TRANSFER_API int rdma_mem_start_ex(int mode, const char* ip, unsigned short port, unsigned int size_bytes, int use_read)
 {
-    if (use_read) { SET_ERROR("RDMA Read mode not yet implemented for memory monitor"); return -1; }
     if (g_mem.mode >= 0) { SET_ERROR("Memory share already active"); return -1; }
     if (mode != 0 && mode != 1) { SET_ERROR("mode must be 0 (display) or 1 (writer)"); return -1; }
     if (size_bytes < 1 || size_bytes > 64 * 1024 * 1024) { SET_ERROR("size must be 1..64MB"); return -1; }
@@ -1248,21 +1247,27 @@ RDMA_TRANSFER_API int rdma_mem_start_ex(int mode, const char* ip, unsigned short
     MemCleanup();
     g_mem.mode = mode;
     g_mem.bufSize = size_bytes;
+    g_mem.useRead = (use_read != 0);
     ResetCancel();
+
+    // Read mode reverses listener/connector roles:
+    //   Write mode: display listens (owns buffer), writer connects
+    //   Read mode:  writer listens (owns buffer), display connects
+    bool isListener = (g_mem.useRead ? (mode == 1) : (mode == 0));
 
     NdContext& ctx = g_mem.ctx;
     struct sockaddr_in localAddr = {};
     struct sockaddr_in remoteAddr = {};
 
     HRESULT hr;
-    if (mode == 1) {
+    if (isListener) {
+        if (ParseIpv4(ip, port, &localAddr) != 0) { MemCleanup(); return -1; }
+    } else {
         if (ParseIpv4(ip, port, &remoteAddr) != 0) { MemCleanup(); return -1; }
         SIZE_T addrLen = sizeof(localAddr);
         hr = NdResolveAddress((const sockaddr*)&remoteAddr, sizeof(remoteAddr),
                                (sockaddr*)&localAddr, &addrLen);
         if (FAILED(hr)) { MemCleanup(); return -1; }
-    } else {
-        if (ParseIpv4(ip, port, &localAddr) != 0) { MemCleanup(); return -1; }
     }
 
     hr = NdOpenAdapter(IID_IND2Adapter, (const sockaddr*)&localAddr, sizeof(localAddr),
@@ -1295,8 +1300,11 @@ RDMA_TRANSFER_API int rdma_mem_start_ex(int mode, const char* ip, unsigned short
     g_mem.pBuf = AllocLarge(totalSize);
     if (!g_mem.pBuf) { MemCleanup(); return -1; }
 
-    hr = ctx.pMr->Register(g_mem.pBuf, totalSize,
-        ND_MR_FLAG_ALLOW_LOCAL_WRITE | ND_MR_FLAG_ALLOW_REMOTE_WRITE, &ctx.ov);
+    {
+        ULONG mrFlags = ND_MR_FLAG_ALLOW_LOCAL_WRITE | ND_MR_FLAG_ALLOW_REMOTE_WRITE;
+        if (g_mem.useRead) mrFlags |= ND_MR_FLAG_ALLOW_REMOTE_READ;
+        hr = ctx.pMr->Register(g_mem.pBuf, totalSize, mrFlags, &ctx.ov);
+    }
     if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pMr, &ctx.ov);
     if (FAILED(hr)) { MemCleanup(); return -1; }
     g_mem.localToken = ctx.pMr->GetLocalToken();
@@ -1313,35 +1321,8 @@ RDMA_TRANSFER_API int rdma_mem_start_ex(int mode, const char* ip, unsigned short
     // Set up doorbell Recv buffer (in MR so Write won't access-violation)
     // The Recv SGE points to pDoorbellRecv which is inside the MR
 
-    if (mode == 1) {
-        // ====== WRITER ======
-        hr = ctx.pConnector->Bind((const sockaddr*)&localAddr, sizeof(localAddr));
-        if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
-        if (FAILED(hr)) { MemCleanup(); return -1; }
-
-        ND2_SGE setupSge = {}; setupSge.Buffer = pSetup;
-        setupSge.BufferLength = sizeof(MemSetupInfo); setupSge.MemoryRegionToken = g_mem.localToken;
-        hr = ctx.pQp->Receive(MEM_SETUP_RECV_CTX, &setupSge, 1);
-        if (FAILED(hr)) { MemCleanup(); return -1; }
-
-        hr = ctx.pConnector->Connect(ctx.pQp, (const sockaddr*)&remoteAddr, sizeof(remoteAddr),
-                                      0, 0, nullptr, 0, &ctx.ov);
-        if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
-        if (FAILED(hr)) { MemCleanup(); return -1; }
-
-        hr = ctx.pConnector->CompleteConnect(&ctx.ov);
-        if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
-        if (FAILED(hr)) { MemCleanup(); return -1; }
-
-        ND2_RESULT cqResult = {};
-        while (ctx.pCq->GetResults(&cqResult, 1) == 0 && !IsCancelled()) {}
-        if (IsCancelled() || cqResult.Status != ND_SUCCESS) { MemCleanup(); return -1; }
-
-        g_mem.remoteAddr  = pSetup->remote_addr;
-        g_mem.remoteToken = pSetup->remote_token;
-        DbgLog("MEM: writer connected");
-    } else {
-        // ====== DISPLAY ======
+    if (isListener) {
+        // ====== LISTENER (Write mode display or Read mode writer) ======
         hr = ctx.pAdapter->CreateListener(IID_IND2Listener, ctx.hOvFile, (void**)&ctx.pListener);
         if (FAILED(hr)) { MemCleanup(); return -1; }
 
@@ -1360,10 +1341,11 @@ RDMA_TRANSFER_API int rdma_mem_start_ex(int mode, const char* ip, unsigned short
         if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pListener, &ctx.ov);
         if (FAILED(hr)) { MemCleanup(); return -1; }
 
-        hr = ctx.pConnector->Accept(ctx.pQp, 0, 0, nullptr, 0, &ctx.ov);
+        hr = ctx.pConnector->Accept(ctx.pQp, g_mem.useRead ? 16 : 0, 0, nullptr, 0, &ctx.ov);
         if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
         if (FAILED(hr)) { MemCleanup(); return -1; }
 
+        // Send our buffer info to connector
         pSetup->remote_addr  = (UINT64)g_mem.pLocalBuf;
         pSetup->remote_token = ctx.pMr->GetRemoteToken();
         pSetup->size         = size_bytes;
@@ -1375,7 +1357,34 @@ RDMA_TRANSFER_API int rdma_mem_start_ex(int mode, const char* ip, unsigned short
         while (ctx.pCq->GetResults(&cqResult, 1) == 0 && !IsCancelled()) {}
         if (IsCancelled() || cqResult.Status != ND_SUCCESS) { MemCleanup(); return -1; }
 
-        DbgLog("MEM: display ready");
+        DbgLog(g_mem.useRead ? "MEM: writer ready (Read mode)" : "MEM: display ready");
+    } else {
+        // ====== CONNECTOR (Write mode writer or Read mode display) ======
+        hr = ctx.pConnector->Bind((const sockaddr*)&localAddr, sizeof(localAddr));
+        if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
+        if (FAILED(hr)) { MemCleanup(); return -1; }
+
+        ND2_SGE setupSge = {}; setupSge.Buffer = pSetup;
+        setupSge.BufferLength = sizeof(MemSetupInfo); setupSge.MemoryRegionToken = g_mem.localToken;
+        hr = ctx.pQp->Receive(MEM_SETUP_RECV_CTX, &setupSge, 1);
+        if (FAILED(hr)) { MemCleanup(); return -1; }
+
+        hr = ctx.pConnector->Connect(ctx.pQp, (const sockaddr*)&remoteAddr, sizeof(remoteAddr),
+                                      g_mem.useRead ? 0 : 0, g_mem.useRead ? 16 : 0, nullptr, 0, &ctx.ov);
+        if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
+        if (FAILED(hr)) { MemCleanup(); return -1; }
+
+        hr = ctx.pConnector->CompleteConnect(&ctx.ov);
+        if (hr == ND_PENDING) hr = WaitOverlapped(ctx.pConnector, &ctx.ov);
+        if (FAILED(hr)) { MemCleanup(); return -1; }
+
+        ND2_RESULT cqResult = {};
+        if (!WaitForCompletion(ctx.pCq, &ctx.ov, cqResult)) { MemCleanup(); return -1; }
+        if (cqResult.Status != ND_SUCCESS) { MemCleanup(); return -1; }
+
+        g_mem.remoteAddr  = pSetup->remote_addr;
+        g_mem.remoteToken = pSetup->remote_token;
+        DbgLog(g_mem.useRead ? "MEM: display connected" : "MEM: writer connected");
     }
 
     g_mem.connected = true;
@@ -1387,6 +1396,12 @@ RDMA_TRANSFER_API int rdma_mem_write(unsigned int offset, const void* data, unsi
     if (!g_mem.connected || g_mem.mode != 1) { SET_ERROR("Not connected as writer"); return -1; }
     if (offset + len > g_mem.bufSize) { SET_ERROR("Write exceeds buffer"); return -1; }
     if (len > CHUNK_SIZE) { SET_ERROR("Write exceeds max size (4MB)"); return -1; }
+
+    // Read mode: just copy to local buffer, display will RDMA Read
+    if (g_mem.useRead) {
+        memcpy((char*)g_mem.pLocalBuf + offset, data, len);
+        return 0;
+    }
 
     NdContext& ctx = g_mem.ctx;
 
@@ -1433,6 +1448,19 @@ RDMA_TRANSFER_API int rdma_mem_wait(int timeout_ms)
     if (!g_mem.connected || g_mem.mode != 0) { SET_ERROR("Not connected as display"); return -1; }
 
     NdContext& ctx = g_mem.ctx;
+
+    // Read mode: RDMA Read the entire buffer from writer, blocking
+    if (g_mem.useRead) {
+        ND2_SGE readSge = {}; readSge.Buffer = g_mem.pLocalBuf;
+        readSge.BufferLength = g_mem.bufSize; readSge.MemoryRegionToken = g_mem.localToken;
+        HRESULT hr = ctx.pQp->Read(MEM_WRITE_CTX, &readSge, 1,
+            g_mem.remoteAddr, g_mem.remoteToken, 0);
+        if (FAILED(hr)) { SET_ERROR("MEM Read failed"); return -1; }
+        ND2_RESULT r = {};
+        while (ctx.pCq->GetResults(&r, 1) == 0) { if (IsCancelled()) return -1; Sleep(1); }
+        return (r.Status == ND_SUCCESS) ? 1 : -1;
+    }
+
     ND2_RESULT cqResult = {};
 
     int elapsed = 0;
